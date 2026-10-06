@@ -195,15 +195,88 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.request('/receive', self.chunk(transfer, data, 0))[0], 200)
 
     def test_assets_and_security_headers(self):
-        for asset in ['/', '/app.js', '/style.css', '/Upload-File.ps1', '/health', '/config']:
+        for asset in ['/', '/app.js', '/style.css', '/Upload-File.ps1', '/Upload-File.sh', '/health', '/config']:
             with self.subTest(asset=asset):
                 status, _, headers = self.request(asset)
                 self.assertEqual(status, 200)
                 self.assertIn('no-store', headers['Cache-Control'])
                 self.assertEqual(headers['Referrer-Policy'], 'no-referrer')
                 self.assertIn("frame-ancestors 'none'", headers['Content-Security-Policy'])
+                if asset.endswith(('.ps1', '.sh')):
+                    self.assertIn(asset[1:], headers['Content-Disposition'])
         self.assertEqual(self.request('/../server.py')[0], 404)
         self.assertEqual(self.request('/download/' + 'x' * 64)[0], 404)
+
+    def shell_upload(self, source, transfer_id, *, environment=None, attempts=1):
+        script = Path(__file__).resolve().parents[1] / 'Upload-File.sh'
+        url = 'http://%s:%s' % self.server.server_address
+        env = dict(os.environ)
+        env['NO_PROXY'] = env.get('NO_PROXY', '') + ',127.0.0.1,localhost'
+        if environment:
+            env.update(environment)
+        process = subprocess.run([shutil.which('dash') or 'sh', str(script), '--server-url', url,
+                                  '--path', str(source), '--transfer-id', transfer_id,
+                                  '--max-attempts', str(attempts)], capture_output=True, text=True,
+                                 env=env, timeout=45)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        result = json.loads(process.stdout)
+        self.assertEqual(result['TransferId'], transfer_id)
+        self.assertEqual(result['SHA256'], hashlib.sha256(source.read_bytes()).hexdigest())
+        self.assertEqual(self.request(urlsplit_path(result['DownloadUrl']))[1], source.read_bytes())
+        return process, result
+
+    @unittest.skipUnless(all(shutil.which(t) for t in ('sh', 'curl', 'jq', 'base64')), 'Shell client dependencies are not installed')
+    def test_posix_shell_binary_resume_and_completed_retry(self):
+        data = bytes(range(256)) * 19 + b'\x00\xffend'
+        source = Path(self.temp.name) / "résumé 'file' $;.bin"
+        source.write_bytes(data)
+        transfer, _ = self.start(data, name=source.name)
+        self.request('/receive', self.chunk(transfer, data, 2))
+        self.shell_upload(source, transfer['id'])
+        self.shell_upload(source, transfer['id'])
+
+    @unittest.skipUnless(all(shutil.which(t) for t in ('sh', 'curl', 'jq', 'base64')), 'Shell client dependencies are not installed')
+    def test_posix_shell_empty_file_and_generated_id(self):
+        source = Path(self.temp.name) / 'empty.bin'
+        source.write_bytes(b'')
+        self.shell_upload(source, secrets.token_hex(16))
+        script = Path(__file__).resolve().parents[1] / 'Upload-File.sh'
+        env = {**os.environ, 'NO_PROXY': '127.0.0.1,localhost'}
+        process = subprocess.run(['sh', str(script), '--server-url', 'http://%s:%s' % self.server.server_address,
+                                  '--path', str(source)], env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertRegex(json.loads(process.stdout)['TransferId'], r'^[a-f0-9]{32}$')
+
+    @unittest.skipUnless(all(shutil.which(t) for t in ('sh', 'curl', 'jq', 'base64')), 'Shell client dependencies are not installed')
+    def test_posix_shell_retries_server_error_and_lost_ack(self):
+        source = Path(self.temp.name) / 'retry.bin'
+        source.write_bytes(os.urandom(137))
+        wrappers = Path(self.temp.name) / 'bin'
+        wrappers.mkdir()
+        wrapper = wrappers / 'curl'
+        wrapper.write_text('''#!/bin/sh
+for arg in "$@"; do
+  case "$arg" in */receive)
+    if [ ! -f "$RETRY_STATE" ]; then
+      printf '1' > "$RETRY_STATE"
+      printf '503'
+      exit 0
+    elif [ "$(cat "$RETRY_STATE")" = 1 ]; then
+      printf '2' > "$RETRY_STATE"
+      "$REAL_CURL" "$@"
+      exit 7
+    fi ;;
+  esac
+done
+exec "$REAL_CURL" "$@"
+''')
+        wrapper.chmod(0o700)
+        state_file = Path(self.temp.name) / 'retry-state'
+        process, _ = self.shell_upload(source, secrets.token_hex(16), attempts=3, environment={
+            'PATH': str(wrappers) + os.pathsep + os.environ['PATH'],
+            'REAL_CURL': shutil.which('curl'), 'RETRY_STATE': str(state_file)})
+        self.assertEqual(state_file.read_text(), '2')
+        self.assertNotIn('/receive?', process.stderr)
 
     @unittest.skipUnless(shutil.which('pwsh'), 'PowerShell is not installed')
     def test_powershell_client_and_resume(self):

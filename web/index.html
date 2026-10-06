@@ -10,16 +10,22 @@
 <body>
   <main>
     <header><span class="mark" aria-hidden="true">↗</span><span>LET'S ESCAPE</span><span class="pill">24-hour file transfer</span></header>
-    <div class="intro"><p class="eyebrow">A small route for your files</p><h1>Send it in pieces.<br>Get it back whole.</h1><p class="lead">Upload from PowerShell with acknowledged GET requests. Your download link appears here once every chunk is verified.</p></div>
+    <div class="intro"><p class="eyebrow">A small route for your files</p><h1>Send it in pieces.<br>Get it back whole.</h1><p class="lead">Upload from PowerShell or your terminal with acknowledged GET requests. Your download link appears here once every chunk is verified.</p></div>
     <section class="card" aria-labelledby="upload-title">
       <div class="section-top"><h2 id="upload-title">Start a transfer</h2><span class="step">01 — UPLOAD</span></div>
-      <p>Download the script, enter your file's local path, then run the command in PowerShell.</p>
-      <a class="button secondary" href="Upload-File.ps1" download>↓ Download PowerShell script</a>
+      <p>Download a script, enter your file's local path, then run the matching command.</p>
+      <div class="script-downloads">
+        <a class="button secondary" href="Upload-File.ps1" download>↓ PowerShell script</a>
+        <a class="button secondary" href="Upload-File.sh" download>↓ Bash / POSIX sh script</a>
+      </div>
       <label for="file-path">File path on your computer</label>
       <input id="file-path" type="text" placeholder="C:\Users\you\Downloads\report.zip" autocomplete="off" spellcheck="false">
-      <div class="command-top"><label for="command">Run from the script's folder</label><button id="copy" type="button">Copy command</button></div>
+      <div class="command-top"><label for="command">PowerShell — run from the script's folder</label><button id="copy" type="button">Copy command</button></div>
       <textarea id="command" rows="4" readonly aria-label="PowerShell upload command"></textarea>
       <p class="hint">On Windows, run <code>Unblock-File .\Upload-File.ps1</code> after downloading it. Your PowerShell execution policy must permit scripts.</p>
+      <div class="command-top"><label for="shell-command">Bash / POSIX sh — run from the script's folder</label><button id="copy-shell" type="button">Copy command</button></div>
+      <textarea id="shell-command" rows="4" readonly aria-label="POSIX shell upload command"></textarea>
+      <p class="hint">For Linux and macOS. Requires <code>curl</code>, <code>jq</code>, <code>base64</code>, and a SHA-256 tool. Use your file's Linux or macOS path above.</p>
       <div class="transfer-line"><span>Transfer ID</span><code id="transfer-id"></code><button id="new-transfer" type="button">New transfer</button></div>
     </section>
     <section class="card" aria-labelledby="result-title">

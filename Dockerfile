@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 WORKDIR /app
 RUN mkdir /data && chown 10001:10001 /data
-COPY server.py Upload-File.ps1 ./
+COPY server.py Upload-File.ps1 Upload-File.sh ./
 COPY web ./web
 ENV HOST=0.0.0.0 PORT=8080 DATA_DIR=/data PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 USER 10001:10001

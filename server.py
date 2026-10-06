@@ -307,11 +307,12 @@ class Handler(BaseHTTPRequestHandler):
                 assets = {"/": ("web/index.html", "text/html; charset=utf-8"),
                           "/app.js": ("web/app.js", "text/javascript; charset=utf-8"),
                           "/style.css": ("web/style.css", "text/css; charset=utf-8"),
-                          "/Upload-File.ps1": ("Upload-File.ps1", "text/plain; charset=utf-8")}
+                          "/Upload-File.ps1": ("Upload-File.ps1", "text/plain; charset=utf-8"),
+                          "/Upload-File.sh": ("Upload-File.sh", "text/plain; charset=utf-8")}
                 if url.path not in assets:
                     raise APIError(404, "Not found")
                 path, content_type = assets[url.path]
-                extra = {"Content-Disposition": 'attachment; filename="Upload-File.ps1"'} if url.path.endswith(".ps1") else None
+                extra = {"Content-Disposition": 'attachment; filename="' + Path(path).name + '"'} if url.path in {"/Upload-File.ps1", "/Upload-File.sh"} else None
                 self.respond(200, (ROOT / path).read_bytes(), content_type, extra)
         except APIError as error:
             self.respond(error.status, {"error": error.message})

@@ -22,9 +22,12 @@ function setTransfer() {
 }
 
 function psQuote(value) { return "'" + value.replaceAll("'", "''") + "'"; }
+function shQuote(value) { return "'" + value.replaceAll("'", "'\"'\"'") + "'"; }
 function command() {
   const filePath = $('file-path').value || 'C:\\path\\to\\your-file.zip';
   $('command').value = `.\\Upload-File.ps1 -ServerUrl ${psQuote(baseUrl)} -Path ${psQuote(filePath)} -TransferId ${psQuote(transferId)} -OpenResult`;
+  const shellPath = $('file-path').value || '/path/to/your-file.zip';
+  $('shell-command').value = `sh ./Upload-File.sh --server-url ${shQuote(baseUrl)} --path ${shQuote(shellPath)} --transfer-id ${shQuote(transferId)} --open-result`;
 }
 async function copy(text, button) {
   try {
@@ -97,6 +100,7 @@ async function poll() {
 
 $('file-path').addEventListener('input', command);
 $('copy').addEventListener('click', () => copy($('command').value, $('copy')));
+$('copy-shell').addEventListener('click', () => copy($('shell-command').value, $('copy-shell')));
 $('copy-link').addEventListener('click', () => copy($('download-link').value, $('copy-link')));
 $('new-transfer').addEventListener('click', () => {
   window.location.hash = 'id=' + crypto.randomUUID().replaceAll('-', '');

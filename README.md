@@ -1,6 +1,6 @@
 # Let's Escape
 
-A file upload service that carries **1 KiB raw chunks in HTTP GET query parameters**. It includes a PowerShell client and an upload page that shows progress and a shareable download link. The server verifies the whole-file SHA-256 before making a download available, and the link expires **24 hours after verification**.
+A file upload service that carries **1 KiB raw chunks in HTTP GET query parameters**. It includes PowerShell and POSIX shell clients and an upload page that shows progress and a shareable download link. The server verifies the whole-file SHA-256 before making a download available, and the link expires **24 hours after verification**.
 
 ## Run locally
 
@@ -25,7 +25,32 @@ If interrupted, rerun with the same file and transfer ID printed by the client:
 .\Upload-File.ps1 -ServerUrl https://upload.example.com -Path 'C:\files\report.zip' -TransferId '0123456789abcdef0123456789abcdef' -OpenResult
 ```
 
-The client requests missing sequences, retries network failures and HTTP 408/429/5xx responses with exponential backoff and jitter, and checks every acknowledgment. `-MaxAttempts` defaults to 5 per request. Successful output includes `DownloadUrl`, `ResultPage`, `ExpiresUtc`, and `SHA256`. The result page uses a URL fragment for the transfer ID, keeping that ID out of the page's initial request.
+Both clients request missing sequences, retry network failures and HTTP 408/429/5xx responses with exponential backoff and jitter, and check every acknowledgment. The default is 5 attempts per request. Successful output includes `DownloadUrl`, `ResultPage`, `ExpiresUtc`, and `SHA256`. The result page uses a URL fragment for the transfer ID, keeping that ID out of the page's initial request.
+
+## Bash / POSIX shell client
+
+The upload page provides `Upload-File.sh` beside the PowerShell download, with a generated command for each. The shell script uses POSIX `sh` syntax and runs under `sh`, `dash`, or Bash on Linux and macOS; Bash-specific features are not required. Dependencies: `curl`, `jq`, `base64`, standard shell utilities, and one of `sha256sum`, `shasum`, or `openssl`. It uses `/dev/urandom` to generate transfer IDs. Install `jq` if needed (for example, `sudo apt install jq` or `brew install jq`).
+
+```sh
+sh ./Upload-File.sh --server-url http://localhost:8080 --path './report.zip' --open-result
+```
+
+Resume an interrupted upload with its transfer ID:
+
+```sh
+sh ./Upload-File.sh --server-url https://upload.example.com --path './report.zip' \
+  --transfer-id '0123456789abcdef0123456789abcdef' --open-result
+```
+
+| PowerShell | POSIX shell |
+| --- | --- |
+| `-ServerUrl` | `--server-url` |
+| `-Path` | `--path` |
+| `-TransferId` | `--transfer-id` |
+| `-MaxAttempts` | `--max-attempts` |
+| `-OpenResult` | `--open-result` |
+
+The shell client prints progress to stderr and the result object as JSON to stdout, so you can save it with `> result.json`. `--open-result` uses `xdg-open` on Linux or `open` on macOS; without a browser opener it prints the result page URL for manual use. It accepts HTTPS for remote servers and HTTP only for loopback, does not follow redirects, ignores `.curlrc`, and removes its private temporary files on exit. It streams one chunk at a time; keep the source file unchanged during upload. Use `--help` for all options.
 
 ## Protocol
 
@@ -101,4 +126,4 @@ python3 -m unittest discover -s tests -v
 node --check web/app.js
 ```
 
-The tests use a live HTTP server and cover out-of-order chunks, duplicate/conflicting retries, concurrent requests, resume after restart, zero-byte files, SHA-256 failure, URL/input limits, HEAD behavior, expiry and cleanup, capacity limits, and response headers. With `pwsh` installed, they also run the actual PowerShell uploader against the server, resume a partially uploaded binary file, rerun a completed upload, and compare downloaded bytes. CI requires PowerShell and builds the container too.
+The tests use a live HTTP server and cover out-of-order chunks, duplicate/conflicting retries, concurrent requests, resume after restart, zero-byte files, SHA-256 failure, URL/input limits, HEAD behavior, expiry and cleanup, capacity limits, and response headers. With `sh`, `curl`, and `jq` installed, they also exercise the actual shell client, including binary/empty files, partial resume, completed retries, and lost acknowledgments. With `pwsh` installed, they run the PowerShell uploader, resume a partially uploaded binary file, rerun a completed upload, and compare downloaded bytes. CI requires the client dependencies and builds the container too.

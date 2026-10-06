@@ -12,6 +12,10 @@ jobs:
           python-version: '3.12'
       - name: Require PowerShell for client integration tests
         run: pwsh -NoProfile -Command '$PSVersionTable.PSVersion'
+      - name: Require POSIX shell client dependencies
+        run: command -v sh && command -v curl && command -v jq && command -v base64 && command -v sha256sum
+      - name: Validate POSIX shell syntax
+        run: dash -n Upload-File.sh
       - name: Run HTTP and PowerShell integration tests
         run: python -m unittest discover -s tests -v
       - name: Validate browser script syntax
