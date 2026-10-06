@@ -1,0 +1,20 @@
+name: Test upload service
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Require PowerShell for client integration tests
+        run: pwsh -NoProfile -Command '$PSVersionTable.PSVersion'
+      - name: Run HTTP and PowerShell integration tests
+        run: python -m unittest discover -s tests -v
+      - name: Validate browser script syntax
+        run: node --check web/app.js
+      - name: Build container
+        run: docker build -t lets-escape:test .

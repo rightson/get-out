@@ -1,0 +1,22 @@
+services:
+  upload:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - uploads:/data
+    environment:
+      CHUNK_SIZE: "1024"
+      MAX_FILE_BYTES: "26214400"
+      MAX_STORAGE_BYTES: "1073741824"
+      MAX_TRANSFERS: "100"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+volumes:
+  uploads:
