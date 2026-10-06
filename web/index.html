@@ -9,7 +9,7 @@
 </head>
 <body>
   <main>
-    <header><span class="mark" aria-hidden="true">↗</span><span>LET'S ESCAPE</span><span class="pill">24-hour file transfer</span></header>
+    <header><span class="mark" aria-hidden="true">↗</span><span>LET'S ESCAPE</span><span class="pill" id="pill">Temporary file transfer</span></header>
     <div class="intro"><p class="eyebrow">A small route for your files</p><h1>Send it in pieces.<br>Get it back whole.</h1><p class="lead">Upload from PowerShell or your terminal with acknowledged GET requests. Your download link appears here once every chunk is verified.</p></div>
     <section class="card" aria-labelledby="upload-title">
       <div class="section-top"><h2 id="upload-title">Start a transfer</h2><span class="step">01 — UPLOAD</span></div>
@@ -43,7 +43,7 @@
         <details><summary>SHA-256 checksum</summary><code id="checksum"></code></details>
       </div>
     </section>
-    <footer><p id="limits">1 KiB chunks · SHA-256 verified · Downloads expire in 24 hours</p><p>Anyone with the download link can access the file. GET URLs may appear in network logs; use a service you trust.</p></footer>
+    <footer><p id="limits">1 KiB chunks · SHA-256 verified · Downloads expire automatically</p><p>Anyone with the download link can access the file. GET URLs may appear in network logs; use a service you trust.</p></footer>
   </main>
 </body>
 </html>

@@ -1,6 +1,6 @@
 # Let's Escape
 
-A file upload service that carries **1 KiB raw chunks in HTTP GET query parameters**. It includes PowerShell and POSIX shell clients and an upload page that shows progress and a shareable download link. The server verifies the whole-file SHA-256 before making a download available, and the link expires **24 hours after verification**.
+A file upload service that carries **1 KiB raw chunks in HTTP GET query parameters**. It includes PowerShell and POSIX shell clients and an upload page that shows progress and a shareable download link. The server verifies the whole-file SHA-256 before making a download available, and the link expires **1 hour after verification** by default (`TTL_HOURS`).
 
 ## Run locally
 
@@ -8,7 +8,10 @@ Requires Linux and Python 3.12 or newer. No Python packages are needed.
 
 ```sh
 python3 server.py
+python3 server.py --port 9000 --ttl-hours 2
 ```
+
+`--port` and `--ttl-hours` override the `PORT` and `TTL_HOURS` environment variables.
 
 Open `http://localhost:8080`, download `Upload-File.ps1`, enter a local file path, and copy the generated command. The page tracks that transfer while PowerShell sends the chunks. The script can also run directly in Windows PowerShell 5.1 or PowerShell 7:
 
@@ -89,7 +92,7 @@ All fields are URL encoded. Transfer IDs are random 128-bit values written as 32
 
    Downloads use `application/octet-stream`, attachment disposition, the original filename, and an `X-File-SHA256` response header. A download may begin only before expiry; an already running response can finish. Range requests are not supported.
 
-An incomplete upload expires 24 hours after creation. Verified files expire 24 hours after completion; neither status reads nor downloads extend this deadline. Expired access returns HTTP 410 until cleanup removes the record, then HTTP 404. A cleanup worker deletes expired files and records every minute and at startup. SQLite reuses freed pages, so its allocated file size need not shrink immediately. Chunks, metadata, and completed files survive process restarts. Run one service process per data directory on local storage; use the proxy in front for public access.
+An incomplete upload expires `TTL_HOURS` after creation. Verified files expire `TTL_HOURS` after completion; neither status reads nor downloads extend this deadline. Expired access returns HTTP 410 until cleanup removes the record, then HTTP 404. A cleanup worker deletes expired files and records every minute and at startup. SQLite reuses freed pages, so its allocated file size need not shrink immediately. Chunks, metadata, and completed files survive process restarts. Run one service process per data directory on local storage; use the proxy in front for public access.
 
 ## Configuration
 
@@ -102,8 +105,9 @@ An incomplete upload expires 24 hours after creation. Verified files expire 24 h
 | `MAX_FILE_BYTES` | `26214400` | Maximum file size, 25 MiB |
 | `MAX_STORAGE_BYTES` | `1073741824` | Sum of reserved file sizes, 1 GiB |
 | `MAX_TRANSFERS` | `100` | Maximum retained transfers, including incomplete/failed ones |
+| `TTL_HOURS` | `1` | Hours until an incomplete upload or verified download expires, from 0.1 to 24 |
 
-The storage budget reserves the declared file size when a transfer starts. Leave additional disk capacity for SQLite overhead, WAL, and the temporary assembled file: this is a logical file budget, not a hard disk quota. Capacity exhaustion returns HTTP 503. The service limits itself to 32 request threads and sets connection timeouts. `/health` is a liveness check; `/config` exposes the chunk and file-size limits.
+The storage budget reserves the declared file size when a transfer starts. Leave additional disk capacity for SQLite overhead, WAL, and the temporary assembled file: this is a logical file budget, not a hard disk quota. Capacity exhaustion returns HTTP 503. The service limits itself to 32 request threads and sets connection timeouts. `/health` is a liveness check; `/config` exposes the chunk size, file-size limit, and expiry in seconds (`ttl_seconds`).
 
 ## Deploy
 

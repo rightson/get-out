@@ -206,6 +206,16 @@ class ServiceTests(unittest.TestCase):
                     self.assertIn(asset[1:], headers['Content-Disposition'])
         self.assertEqual(self.request('/../server.py')[0], 404)
         self.assertEqual(self.request('/download/' + 'x' * 64)[0], 404)
+        self.assertEqual(self.request('/config')[1]['ttl_seconds'], TTL)
+
+    def test_configurable_expiry(self):
+        store = Store(self.temp.name, ttl=6 * 60, clock=lambda: self.now)
+        self.server.store = store
+        transfer, _ = self.start(b'')
+        self.assertEqual(transfer['expires'], self.now + 6 * 60)
+        for ttl in (6 * 60 - 1, 24 * 60 * 60 + 1):
+            with self.subTest(ttl=ttl), self.assertRaises(ValueError):
+                Store(self.temp.name, ttl=ttl)
 
     def shell_upload(self, source, transfer_id, *, environment=None, attempts=1):
         script = Path(__file__).resolve().parents[1] / 'Upload-File.sh'

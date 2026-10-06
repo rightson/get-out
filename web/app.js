@@ -5,6 +5,7 @@ let transferId;
 let seen = false;
 let terminal = false;
 let polling = false;
+let ttlText = '';
 
 function setTransfer() {
   const candidate = new URLSearchParams(window.location.hash.slice(1)).get('id');
@@ -81,7 +82,7 @@ async function poll() {
       const downloadUrl = baseUrl + upload.download_url;
       $('download').href = downloadUrl;
       $('download-link').value = downloadUrl;
-      $('expires').textContent = `Available until ${expiration.toLocaleString()} (24 hours after upload).`;
+      $('expires').textContent = `Available until ${expiration.toLocaleString()}${ttlText && ` (${ttlText} after upload)`}.`;
       $('checksum').textContent = upload.sha256;
       $('result').hidden = false;
       // Keep checking expiry so a tab left open does not advertise an expired link.
@@ -110,5 +111,8 @@ setTransfer();
 poll();
 setInterval(poll, 2500);
 fetch(`${baseUrl}/config`, { cache: 'no-store' }).then((r) => r.json()).then((config) => {
-  $('limits').textContent = `${config.chunk_size.toLocaleString()}-byte chunks · Maximum ${(config.max_file_size / 1024 / 1024).toLocaleString()} MiB per file · Downloads expire in 24 hours`;
+  const minutes = Math.round(config.ttl_seconds / 60);
+  ttlText = minutes < 60 ? `${minutes} minutes` : `${+(minutes / 60).toFixed(1)} hour${minutes === 60 ? '' : 's'}`;
+  $('pill').textContent = `${ttlText.replace(/s$/, '').replace(' ', '-')} file transfer`;
+  $('limits').textContent = `${config.chunk_size.toLocaleString()}-byte chunks · Maximum ${(config.max_file_size / 1024 / 1024).toLocaleString()} MiB per file · Downloads expire in ${ttlText}`;
 }).catch(() => {});

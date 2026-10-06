@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Durable GET-only chunk uploads. Python 3.12+, no third-party dependencies."""
+import argparse
 import base64
 from contextlib import contextmanager
 import hashlib
@@ -17,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlsplit
 
 ROOT = Path(__file__).resolve().parent
-TTL = 24 * 60 * 60
+TTL = 60 * 60
 ID_RE = re.compile(r"[a-f0-9]{32}\Z")
 HASH_RE = re.compile(r"[a-f0-9]{64}\Z")
 
@@ -29,16 +30,18 @@ class APIError(Exception):
 
 class Store:
     def __init__(self, directory, *, chunk_size=1024, max_file=25 * 1024**2,
-                 max_storage=1024**3, max_transfers=100, clock=time.time):
+                 max_storage=1024**3, max_transfers=100, ttl=TTL, clock=time.time):
         if not 64 <= chunk_size <= 1024 or min(max_file, max_storage, max_transfers) <= 0:
             raise ValueError("Invalid storage limits or chunk size")
+        if not 6 * 60 <= ttl <= 24 * 60 * 60:
+            raise ValueError("Expiry must be from 0.1 to 24 hours")
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.files = self.directory / "files"
         self.files.mkdir(exist_ok=True, mode=0o700)
         self.db = self.directory / "uploads.sqlite3"
         self.chunk_size, self.max_file = chunk_size, max_file
-        self.max_storage, self.max_transfers, self.clock = max_storage, max_transfers, clock
+        self.max_storage, self.max_transfers, self.ttl, self.clock = max_storage, max_transfers, ttl, clock
         with self.connect() as conn:
             conn.executescript("""
                 PRAGMA journal_mode=WAL;
@@ -120,7 +123,7 @@ class Store:
             conn.execute("INSERT INTO transfers(id,name,size,sha256,total,chunk_size,state,created,expires,token) "
                          "VALUES(?,?,?,?,?,?,'uploading',?,?,?)",
                          (transfer_id, name, size, digest, max(1, math.ceil(size / self.chunk_size)),
-                          self.chunk_size, now, now + TTL, secrets.token_hex(32)))
+                          self.chunk_size, now, now + self.ttl, secrets.token_hex(32)))
             return self.result(self.get(conn, transfer_id))
 
     def receive(self, params):
@@ -190,7 +193,7 @@ class Store:
                 os.fsync(directory_fd)
             finally:
                 os.close(directory_fd)
-            conn.execute("UPDATE transfers SET state='complete',expires=? WHERE id=?", (self.clock() + TTL, row["id"]))
+            conn.execute("UPDATE transfers SET state='complete',expires=? WHERE id=?", (self.clock() + self.ttl, row["id"]))
             conn.execute("DELETE FROM chunks WHERE id=?", (row["id"],))
         finally:
             temporary.unlink(missing_ok=True)
@@ -302,7 +305,8 @@ class Handler(BaseHTTPRequestHandler):
             elif url.path == "/health":
                 self.respond(200, {"status": "ok"})
             elif url.path == "/config":
-                self.respond(200, {"chunk_size": self.server.store.chunk_size, "max_file_size": self.server.store.max_file})
+                self.respond(200, {"chunk_size": self.server.store.chunk_size, "max_file_size": self.server.store.max_file,
+                                   "ttl_seconds": self.server.store.ttl})
             else:
                 assets = {"/": ("web/index.html", "text/html; charset=utf-8"),
                           "/app.js": ("web/app.js", "text/javascript; charset=utf-8"),
@@ -355,13 +359,22 @@ class Server(ThreadingHTTPServer):
             self.slots.release()
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="GET chunk upload service")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8080")),
+                        help="listen port (default: $PORT or 8080)")
+    parser.add_argument("--ttl-hours", type=float, default=float(os.environ.get("TTL_HOURS", "1")),
+                        help="hours until transfers expire, 0.1 to 24 (default: $TTL_HOURS or 1)")
+    args = parser.parse_args(argv)
+    if not 0.1 <= args.ttl_hours <= 24:
+        parser.error("--ttl-hours must be from 0.1 to 24")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     store = Store(os.environ.get("DATA_DIR", "data"),
                   chunk_size=int(os.environ.get("CHUNK_SIZE", "1024")),
                   max_file=int(os.environ.get("MAX_FILE_BYTES", str(25 * 1024**2))),
                   max_storage=int(os.environ.get("MAX_STORAGE_BYTES", str(1024**3))),
-                  max_transfers=int(os.environ.get("MAX_TRANSFERS", "100")))
+                  max_transfers=int(os.environ.get("MAX_TRANSFERS", "100")),
+                  ttl=args.ttl_hours * 60 * 60)
     stop = threading.Event()
 
     def janitor():
@@ -372,7 +385,7 @@ def main():
                 logging.exception("Cleanup failed")
 
     threading.Thread(target=janitor, daemon=True).start()
-    server = Server((os.environ.get("HOST", "127.0.0.1"), int(os.environ.get("PORT", "8080"))), store)
+    server = Server((os.environ.get("HOST", "127.0.0.1"), args.port), store)
     logging.info("Upload service listening on %s:%s", *server.server_address)
     try:
         server.serve_forever()
