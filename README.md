@@ -32,17 +32,17 @@ Unblock-File .\Upload-File.ps1
 
 Your execution policy must allow scripts. The client requires HTTPS for remote servers; HTTP is allowed only for loopback development. It hashes and streams the file from a single read handle, rather than loading the entire file into memory.
 
-If interrupted, rerun with the same file and transfer ID printed by the client:
+If interrupted, rerun with the same file and transfer ID printed by the client. The upload page's IDs are four words, so they are easy to read aloud or type on another machine; both clients accept them in any case and with spaces instead of hyphens:
 
 ```powershell
-.\Upload-File.ps1 -ServerUrl https://upload.example.com -Path 'C:\files\report.zip' -ExpiresHours 1 -TransferId '0123456789abcdef0123456789abcdef' -OpenResult
+.\Upload-File.ps1 -ServerUrl https://upload.example.com -Path 'C:\files\report.zip' -ExpiresHours 1 -TransferId 'acorn-tulip-gravy-snore' -OpenResult
 ```
 
 Both clients request missing sequences, retry network failures and HTTP 408/429/5xx responses with exponential backoff and jitter, and check every acknowledgment. The default is 5 attempts per request. A resume must repeat the same expiry and password. Successful output includes `DownloadUrl`, `ResultPage`, `ExpiresUtc`, `PasswordProtected`, and `SHA256`. The result page uses a URL fragment for the transfer ID, keeping that ID out of the page's initial request.
 
 ## Bash / POSIX shell client
 
-The upload page's script section provides `Upload-File.sh` beside the PowerShell download, with a generated command for each. The shell script uses POSIX `sh` syntax and runs under `sh`, `dash`, or Bash on Linux and macOS; Bash-specific features are not required. Dependencies: `curl`, `jq`, `base64`, standard shell utilities, and one of `sha256sum`, `shasum`, or `openssl`. It uses `/dev/urandom` to generate transfer IDs. Install `jq` if needed (for example, `sudo apt install jq` or `brew install jq`).
+The upload page's script section provides `Upload-File.sh` beside the PowerShell download, with a generated command for each. The shell script uses POSIX `sh` syntax and runs under `sh`, `dash`, or Bash on Linux and macOS; Bash-specific features are not required. Dependencies: `curl`, `jq`, `base64`, standard shell utilities, and one of `sha256sum`, `shasum`, or `openssl`. Run without `--transfer-id`, it uses `/dev/urandom` to generate a 32-character hex ID. Install `jq` if needed (for example, `sudo apt install jq` or `brew install jq`).
 
 ```sh
 sh ./Upload-File.sh --server-url http://localhost:8080 --path './report.zip' --expires-hours 1 --open-result
@@ -54,7 +54,7 @@ Resume an interrupted upload with its transfer ID:
 
 ```sh
 sh ./Upload-File.sh --server-url https://upload.example.com --path './report.zip' \
-  --expires-hours 1 --transfer-id '0123456789abcdef0123456789abcdef' --open-result
+  --expires-hours 1 --transfer-id 'acorn-tulip-gravy-snore' --open-result
 ```
 
 | PowerShell | POSIX shell |
@@ -71,7 +71,9 @@ The shell client prints progress to stderr and the result object as JSON to stdo
 
 ## Protocol
 
-All fields are URL encoded. Transfer IDs are random 128-bit values written as 32 lowercase hexadecimal characters. Treat them as bearer capabilities: anyone holding one can query transfer progress and obtain the eventual download URL.
+All fields are URL encoded. A transfer ID is either four lowercase words joined by hyphens, drawn uniformly from `web/words.txt` ([EFF short wordlist 1](https://www.eff.org/dice), CC BY 3.0 US, without its one hyphenated word: 1,295 words of 3 to 5 letters, about 41 bits), or 32 lowercase hexadecimal characters (128 bits; clients run without an ID generate these). The upload page generates word IDs; the server rejects words that are not in the list, so a typo fails loudly instead of silently starting a different transfer. Treat IDs as bearer capabilities: anyone holding one can query transfer progress and obtain the eventual download URL.
+
+Word IDs are short enough to guess online, so the service limits each client IP to `ID_MISS_LIMIT` (default 120) `/status` or `/receive` requests per minute for IDs it does not know. Past the limit, those endpoints return HTTP 429 with `Retry-After` until the minute ends, for known IDs too, so a guess cannot be confirmed. `/start` is not limited. With 100 live transfers, finding any one of them at that rate takes centuries per IP address. Behind a reverse proxy, enable `TRUST_PROXY` so the limit applies per client rather than to the proxy's address.
 
 1. Register file metadata (idempotent for the same ID and metadata):
 
@@ -120,6 +122,7 @@ An incomplete upload expires 24 hours after creation, regardless of the chosen l
 | `MAX_FILE_MB` | `10` | Maximum file size in MiB (`--max-file-mb`) |
 | `MAX_STORAGE_BYTES` | `1073741824` | Sum of reserved file sizes, 1 GiB |
 | `MAX_TRANSFERS` | `100` | Maximum retained transfers, including incomplete/failed ones |
+| `ID_MISS_LIMIT` | `120` | Per-IP lookups of unknown transfer IDs allowed per minute |
 | `TRUST_PROXY` | unset | `1` logs the client IP from the proxy's `X-Real-IP` header (`--trust-proxy`) |
 
 The storage budget reserves the declared file size when a transfer starts. Leave additional disk capacity for SQLite overhead, WAL, and the temporary assembled file: this is a logical file budget, not a hard disk quota. Capacity exhaustion returns HTTP 503. The service limits itself to 32 request threads and sets connection timeouts. `/health` is a liveness check; `/config` exposes the chunk size, file-size limit, and allowed link lifetime (`min_ttl_hours`, `max_ttl_hours`).

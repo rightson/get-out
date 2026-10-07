@@ -17,7 +17,7 @@ import time
 import unittest
 from urllib.parse import urlencode
 
-from server import MAX_TTL, MIN_TTL, UPLOAD_WINDOW, Server, Store, audit_report
+from server import MAX_TTL, MIN_TTL, UPLOAD_WINDOW, WORDS, Server, Store, audit_report
 
 HOUR = 60 * 60
 
@@ -107,6 +107,39 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(repeat['expires'], result['expires'])
         self.assertEqual(self.request('/receive', wrong)[0], 409)
         self.assertEqual(self.request('/start', params)[1]['download_url'], result['download_url'])
+
+    def test_word_transfer_ids(self):
+        words = sorted(WORDS)
+        self.assertEqual(len(words), 1295)
+        self.assertTrue(all(3 <= len(w) <= 5 and w.isascii() and w.isalpha() and w.islower() for w in words))
+        status, served, _ = self.request('/words.txt')
+        self.assertEqual((status, sorted(served.decode().split())), (200, words))
+        transfer_id = '-'.join(secrets.choice(words) for _ in range(4))
+        data = os.urandom(2500)
+        result = self.upload(data, transfer_id=transfer_id)
+        self.assertEqual((result['id'], result['state']), (transfer_id, 'complete'))
+        self.assertEqual(self.request(result['download_url'])[1], data)
+        self.assertEqual(self.request('/status', {'id': transfer_id})[1]['download_url'], result['download_url'])
+        valid = words[:4]
+        for bad in ['-'.join(valid).upper(), ' '.join(valid), '-'.join(valid[:3]), '-'.join(valid + valid[:1]),
+                    '-'.join(valid[:3] + ['zzzzz']), '-'.join(valid) + '-', 'A' * 32]:
+            with self.subTest(id=bad):
+                self.assertEqual(self.request('/status', {'id': bad})[0], 400)
+
+    def test_unknown_id_lookups_are_rate_limited_per_ip(self):
+        self.server.misses.limit = 3
+        unknown = lambda: self.request('/status', {'id': '-'.join(secrets.choice(sorted(WORDS)) for _ in range(4))})
+        self.assertEqual([unknown()[0] for _ in range(3)], [404] * 3)
+        status, _, headers = unknown()
+        self.assertEqual(status, 429)
+        self.assertEqual(headers['Retry-After'], '60')
+        # Known IDs are blocked too, so a guess cannot be confirmed; starting an upload is not.
+        data = b'still allowed'
+        transfer, _ = self.start(data)
+        self.assertEqual(self.request('/receive', self.chunk(transfer, data, 0))[0], 429)
+        self.now += 60
+        self.assertEqual(self.request('/receive', self.chunk(transfer, data, 0))[1]['state'], 'complete')
+        self.assertEqual(unknown()[0], 404)
 
     def test_empty_file(self):
         result = self.upload(b'')
@@ -211,7 +244,7 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.request('/receive', self.chunk(transfer, data, 0))[0], 200)
 
     def test_assets_and_security_headers(self):
-        for asset in ['/', '/app.js', '/style.css', '/Upload-File.ps1', '/Upload-File.sh', '/health', '/config']:
+        for asset in ['/', '/app.js', '/style.css', '/words.txt', '/Upload-File.ps1', '/Upload-File.sh', '/health', '/config']:
             with self.subTest(asset=asset):
                 status, _, headers = self.request(asset)
                 self.assertEqual(status, 200)
@@ -307,6 +340,8 @@ class ServiceTests(unittest.TestCase):
         work.mkdir()
         source = work / 'server.py'
         shutil.copy(Path(__file__).resolve().parents[1] / 'server.py', source)
+        (work / 'web').mkdir()
+        shutil.copy(Path(__file__).resolve().parents[1] / 'web' / 'words.txt', work / 'web' / 'words.txt')
         with socket.socket() as probe:
             probe.bind(('127.0.0.1', 0))
             port = probe.getsockname()[1]
@@ -378,7 +413,8 @@ class ServiceTests(unittest.TestCase):
         self.assertIn('could not reach the server', page['error'])
         self.assertTrue(page['scriptsOpen'])  # Network problems point to the script fallback.
 
-    def shell_upload(self, source, transfer_id, *, environment=None, attempts=1, extra=(), stdin=None, password=None):
+    def shell_upload(self, source, transfer_id, *, environment=None, attempts=1, extra=(), stdin=None, password=None,
+                     expected_id=None):
         script = Path(__file__).resolve().parents[1] / 'Upload-File.sh'
         url = 'http://%s:%s' % self.server.server_address
         env = dict(os.environ)
@@ -391,7 +427,7 @@ class ServiceTests(unittest.TestCase):
                                  env=env, timeout=45, input=stdin)
         self.assertEqual(process.returncode, 0, process.stderr)
         result = json.loads(process.stdout)
-        self.assertEqual(result['TransferId'], transfer_id)
+        self.assertEqual(result['TransferId'], expected_id or transfer_id)
         self.assertEqual(result['SHA256'], hashlib.sha256(source.read_bytes()).hexdigest())
         self.assertEqual(result['PasswordProtected'], password is not None)
         self.assertEqual(self.request(urlsplit_path(result['DownloadUrl']), headers=password and basic(password))[1],
@@ -407,6 +443,13 @@ class ServiceTests(unittest.TestCase):
         self.request('/receive', self.chunk(transfer, data, 2))
         self.shell_upload(source, transfer['id'])
         self.shell_upload(source, transfer['id'])
+
+    @unittest.skipUnless(all(shutil.which(t) for t in ('sh', 'curl', 'jq', 'base64')), 'Shell client dependencies are not installed')
+    def test_posix_shell_accepts_typed_word_id(self):
+        source = Path(self.temp.name) / 'words.bin'
+        source.write_bytes(os.urandom(1500))
+        words = sorted(WORDS)[:4]
+        self.shell_upload(source, '  ' + words[0].upper() + ' ' + ' '.join(words[1:]) + ' ', expected_id='-'.join(words))
 
     @unittest.skipUnless(all(shutil.which(t) for t in ('sh', 'curl', 'jq', 'base64')), 'Shell client dependencies are not installed')
     def test_posix_shell_empty_file_generated_id_and_expiry_validation(self):
@@ -475,23 +518,27 @@ exec "$REAL_CURL" "$@"
         source.write_bytes(data)
         output = Path(self.temp.name) / 'result.json'
         script = Path(__file__).resolve().parents[1] / 'Upload-File.ps1'
-        transfer_id = secrets.token_hex(16)
+        words = [secrets.choice(sorted(WORDS)) for _ in range(4)]
+        transfer_id = '-'.join(words)
         url = 'http://%s:%s' % self.server.server_address
         password = "pä'ss"
         def ps_quote(value):
             return "'" + str(value).replace("'", "''") + "'"
-        command = ('& ' + ps_quote(script) + ' -ServerUrl ' + ps_quote(url) + ' -Path ' + ps_quote(source)
-                   + ' -TransferId ' + ps_quote(transfer_id) + ' -ExpiresHours 1.5'
-                   + ' -DownloadPassword (ConvertTo-SecureString ' + ps_quote(password) + ' -AsPlainText -Force)'
-                   + ' | ConvertTo-Json | Set-Content -LiteralPath ' + ps_quote(output))
+        def command(typed_id):
+            return ('& ' + ps_quote(script) + ' -ServerUrl ' + ps_quote(url) + ' -Path ' + ps_quote(source)
+                    + ' -TransferId ' + ps_quote(typed_id) + ' -ExpiresHours 1.5'
+                    + ' -DownloadPassword (ConvertTo-SecureString ' + ps_quote(password) + ' -AsPlainText -Force)'
+                    + ' | ConvertTo-Json | Set-Content -LiteralPath ' + ps_quote(output))
         # Pre-upload one chunk to exercise resume, then rerun the fully completed transfer.
         transfer, _ = self.start(data, name=source.name, transfer_id=transfer_id, ttl_hours='1.5', password=password)
         self.request('/receive', self.chunk(transfer, data, 2))
-        for _ in range(2):
+        # The first run passes the ID as someone might type it by hand.
+        for typed_id in (' ' + words[0].upper() + '  ' + ' '.join(words[1:]), transfer_id):
             process = subprocess.run(['pwsh', '-NoProfile', '-NonInteractive', '-Command',
-                                      "$ErrorActionPreference='Stop'; " + command], capture_output=True, text=True, timeout=30)
+                                      "$ErrorActionPreference='Stop'; " + command(typed_id)], capture_output=True, text=True, timeout=30)
             self.assertEqual(process.returncode, 0, process.stderr)
             result = json.loads(output.read_text(encoding='utf-8-sig'))
+            self.assertEqual(result['TransferId'], transfer_id)
             self.assertEqual(result['SHA256'], hashlib.sha256(data).hexdigest())
             self.assertTrue(result['PasswordProtected'])
             self.assertEqual(self.request(urlsplit_path(result['DownloadUrl']))[0], 401)

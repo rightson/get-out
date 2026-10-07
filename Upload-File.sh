@@ -11,7 +11,8 @@ Usage: sh Upload-File.sh --server-url URL --path FILE --expires-hours H [options
   --path FILE        File to upload
   --expires-hours H  Download link lifetime after upload, 0.1 to 24 hours
   --ask-password     Require a download password (read from the terminal, or the first line of stdin)
-  --transfer-id ID   32 lowercase hex characters; reuse to resume the same file
+  --transfer-id ID   Four words from the upload page (e.g. acorn-tulip-gravy-snore)
+                     or 32 hex characters; reuse to resume the same file
   --max-attempts N   Attempts per request, from 1 to 10 (default: 5)
   --open-result     Open the result page using xdg-open or macOS open
   --help            Show this help
@@ -78,8 +79,10 @@ case "$file_path" in /*) ;; *) file_path=$PWD/$file_path ;; esac
 if [ -z "$transfer_id" ]; then
     transfer_id=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
 fi
-case "$transfer_id" in ''|*[!a-f0-9]*) die 'Transfer ID must be 32 lowercase hexadecimal characters.' ;; esac
-[ "${#transfer_id}" -eq 32 ] || die 'Transfer ID must be 32 lowercase hexadecimal characters.'
+# Accept IDs typed by hand in any case, with spaces or other separators between the words.
+transfer_id=$(printf '%s' "$transfer_id" | tr 'A-Z' 'a-z' | tr -cs 'a-z0-9' '-' | sed 's/^-*//; s/-*$//')
+printf '%s\n' "$transfer_id" | grep -Eqx '[a-f0-9]{32}|[a-z]{3,5}(-[a-z]{3,5}){3}' ||
+    die 'Transfer ID must be four words joined by hyphens (as shown on the upload page) or 32 hexadecimal characters.'
 
 # Exclusive mkdir and restrictive permissions avoid relying on a non-POSIX mktemp.
 umask 077
