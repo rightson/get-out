@@ -5,6 +5,8 @@ let transferId;
 let seen = false;
 let terminal = false;
 let polling = false;
+let uploading = false;
+let maxFileSize = Infinity;
 
 function setTransfer() {
   const candidate = new URLSearchParams(window.location.hash.slice(1)).get('id');
@@ -15,9 +17,10 @@ function setTransfer() {
   $('transfer-id').textContent = transferId;
   $('result').hidden = true;
   $('progress').value = 0;
-  $('status').textContent = 'Waiting for your script';
+  $('status').textContent = 'Waiting for an upload';
   $('status-dot').className = 'dot';
-  $('detail').textContent = 'Keep this page open while the script uploads. Interrupted uploads can resume with the same transfer ID.';
+  $('detail').textContent = 'Keep this page open while the file uploads. Interrupted uploads can resume with the same transfer ID.';
+  $('upload-error').hidden = true;
   command();
 }
 
@@ -57,6 +60,104 @@ function showError(message) {
   $('status-dot').className = 'dot error';
   $('result').hidden = true;
 }
+class UploadError extends Error {
+  // fallback: a script could succeed where the browser could not (network, proxy, or HTTPS problems).
+  constructor(message, fallback = false) { super(message); this.fallback = fallback; }
+}
+const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+function base64url(bytes) {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+}
+// Same protocol and retry policy as the scripts: retry network errors, 408, 429, and 5xx.
+async function call(path, params, headers = {}) {
+  const url = `${baseUrl}${path}?${new URLSearchParams(params)}`;
+  for (let attempt = 1; ; attempt++) {
+    let response = null;
+    try {
+      response = await fetch(url, { cache: 'no-store', referrerPolicy: 'no-referrer', headers });
+    } catch { /* Network failure: retry below. */ }
+    if (response?.ok) return response.json();
+    const retry = !response || response.status === 408 || response.status === 429 || response.status >= 500;
+    if (!retry || attempt === 5) {
+      if (!response) throw new UploadError('The browser could not reach the server.', true);
+      const reason = (await response.json().catch(() => ({}))).error || `HTTP ${response.status}`;
+      throw new UploadError(`The server did not accept the upload (${reason}).`, retry);
+    }
+    await sleep(Math.min(8000, 500 * 2 ** (attempt - 1)) + Math.random() * 250);
+  }
+}
+async function browserUpload() {
+  const file = $('file').files[0];
+  const id = transferId;
+  const guard = () => { if (id !== transferId) throw new UploadError('Upload stopped: you started a new transfer.'); };
+  if (!file) throw new UploadError('Choose a file first.');
+  if (file.size > maxFileSize) throw new UploadError(`The file exceeds the ${(maxFileSize / 1024 / 1024).toLocaleString()} MiB size limit.`);
+  const headers = {};
+  if ($('ask-password').checked) {
+    const password = $('password').value;
+    if (![...password].length || [...password].length > 128) throw new UploadError('Enter a download password of 1 to 128 characters.');
+    if (password !== $('password-confirm').value) throw new UploadError('The passwords do not match.');
+    headers.Authorization = 'Basic ' + btoa(String.fromCharCode(...new TextEncoder().encode(':' + password)));
+  }
+  if (!crypto.subtle) throw new UploadError('This browser can only calculate SHA-256 over HTTPS.', true);
+  $('status').textContent = 'Reading and hashing your file';
+  $('status-dot').className = 'dot active';
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const digest = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map((b) => b.toString(16).padStart(2, '0')).join('');
+  guard();
+  const transfer = await call('/start', { id, name: file.name, size: file.size, sha256: digest, ttl_hours: expiresHours() }, headers);
+  const { chunk_size: chunkSize, total } = transfer;
+  let state = transfer.state;
+  while (state === 'uploading') {
+    guard();
+    const status = await call('/status', { id });
+    state = status.state;
+    if (state !== 'uploading') break;
+    const missing = status.missing;
+    let next = 0;
+    let stopped = false;
+    // A few requests in flight hide latency without tripping proxy rate limits.
+    const worker = async () => {
+      while (next < missing.length && !stopped) {
+        guard();
+        const seq = missing[next++];
+        const ack = await call('/receive', { id, seq, total, data: base64url(bytes.subarray(seq * chunkSize, (seq + 1) * chunkSize)) });
+        if (id === transferId) $('progress').value = 100 * ack.received / total;
+        state = ack.state;
+      }
+    };
+    await Promise.all(Array.from({ length: 4 }, () => worker().catch((error) => { stopped = true; throw error; })));
+  }
+  if (state === 'failed') throw new UploadError('SHA-256 verification failed. Start a new transfer and try again.');
+  poll();
+}
+function setUploading(active) {
+  uploading = active;
+  for (const id of ['file', 'expires-hours', 'ask-password', 'password', 'password-confirm', 'upload']) $(id).disabled = active;
+}
+async function startBrowserUpload() {
+  if (uploading) return;
+  $('upload-error').hidden = true;
+  setUploading(true);
+  const id = transferId;
+  try {
+    await browserUpload();
+  } catch (error) {
+    if (id !== transferId) return; // The user started a new transfer; leave its fresh status alone.
+    showError('Upload did not finish');
+    const known = error instanceof UploadError;
+    const fallback = !known || error.fallback;
+    $('upload-error').textContent = (known ? error.message : 'The browser could not upload this file.')
+      + (fallback ? ' You can finish with a script below; it resumes the same transfer.' : '');
+    $('upload-error').hidden = false;
+    if (fallback) $('scripts').open = true;
+  } finally {
+    setUploading(false);
+  }
+}
+
 async function poll() {
   if (polling || terminal) return;
   polling = true;
@@ -78,7 +179,7 @@ async function poll() {
     $('progress').value = 100 * upload.received / upload.total;
     if (upload.state === 'failed') {
       showError('File verification failed');
-      $('detail').textContent = 'The SHA-256 checksum did not match. Start a new transfer and run the script again.';
+      $('detail').textContent = 'The SHA-256 checksum did not match. Start a new transfer and upload again.';
       terminal = true;
     } else if (upload.state === 'complete') {
       const expiration = new Date(upload.expires * 1000);
@@ -114,7 +215,8 @@ async function poll() {
 
 $('file-path').addEventListener('input', command);
 $('expires-hours').addEventListener('input', command);
-$('ask-password').addEventListener('change', command);
+$('ask-password').addEventListener('change', () => { $('password-fields').hidden = !$('ask-password').checked; command(); });
+$('upload').addEventListener('click', startBrowserUpload);
 $('copy').addEventListener('click', () => copy($('command').value, $('copy')));
 $('copy-shell').addEventListener('click', () => copy($('shell-command').value, $('copy-shell')));
 $('copy-link').addEventListener('click', () => copy($('download-link').value, $('copy-link')));
@@ -126,5 +228,6 @@ setTransfer();
 poll();
 setInterval(poll, 2500);
 fetch(`${baseUrl}/config`, { cache: 'no-store' }).then((r) => r.json()).then((config) => {
+  maxFileSize = config.max_file_size;
   $('limits').textContent = `${config.chunk_size.toLocaleString()}-byte chunks · Maximum ${(config.max_file_size / 1024 / 1024).toLocaleString()} MiB per file · You choose when the link disappears (${duration(config.min_ttl_hours)} to ${duration(config.max_ttl_hours)})`;
 }).catch(() => {});
