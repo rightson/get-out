@@ -243,6 +243,26 @@ $('file-path').addEventListener('input', command);
 $('expires-hours').addEventListener('input', command);
 $('ask-password').addEventListener('change', () => { $('password-fields').hidden = !$('ask-password').checked; command(); });
 $('upload').addEventListener('click', startBrowserUpload);
+// Dropping a file on the zone selects it; dropping anywhere else must not navigate away from the page.
+for (const type of ['dragover', 'drop']) window.addEventListener(type, (event) => event.preventDefault());
+for (const type of ['dragenter', 'dragover']) {
+  $('drop-zone').addEventListener(type, (event) => {
+    event.preventDefault();
+    if (!uploading) $('drop-zone').classList.add('over');
+  });
+}
+$('drop-zone').addEventListener('dragleave', (event) => {
+  if (!$('drop-zone').contains(event.relatedTarget)) $('drop-zone').classList.remove('over');
+});
+$('drop-zone').addEventListener('drop', (event) => {
+  event.preventDefault();
+  $('drop-zone').classList.remove('over');
+  const file = event.dataTransfer.files[0];
+  if (uploading || !file) return;
+  const selection = new DataTransfer();
+  selection.items.add(file);
+  $('file').files = selection.files;
+});
 $('copy').addEventListener('click', () => copy($('command').value, $('copy')));
 $('copy-shell').addEventListener('click', () => copy($('shell-command').value, $('copy-shell')));
 $('copy-link').addEventListener('click', () => copy($('download-link').value, $('copy-link')));
