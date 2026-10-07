@@ -25,7 +25,11 @@ ROOT = Path(__file__).resolve().parent
 MIN_TTL, MAX_TTL = 6 * 60, 24 * 60 * 60
 UPLOAD_WINDOW = 24 * 60 * 60
 TTL_RE = re.compile(r"(?:0|[1-9][0-9]?)(?:\.[0-9]{1,2})?\Z")
-ID_RE = re.compile(r"[a-f0-9]{32}\Z")
+# Transfer IDs are four words from web/words.txt (EFF short wordlist 1, ~41 bits)
+# or, from older clients and scripts run without an ID, 32 random hex characters.
+WORDS = frozenset((ROOT / "web" / "words.txt").read_text().split())
+ID_WORDS = 4
+ID_RE = re.compile(r"(?:[a-f0-9]{32}|[a-z]{3,5}(?:-[a-z]{3,5}){%d})\Z" % (ID_WORDS - 1))
 HASH_RE = re.compile(r"[a-f0-9]{64}\Z")
 
 
@@ -108,7 +112,9 @@ class Store:
     @staticmethod
     def transfer_id(value):
         if not ID_RE.fullmatch(value):
-            raise APIError(400, "id must be 32 lowercase hexadecimal characters")
+            raise APIError(400, "id must be four lowercase words joined by hyphens, or 32 lowercase hexadecimal characters")
+        if "-" in value and not WORDS.issuperset(value.split("-")):
+            raise APIError(400, "id contains a word that is not in the word list; check the spelling")
         return value
 
     @staticmethod
@@ -404,10 +410,21 @@ class Handler(BaseHTTPRequestHandler):
                 if set(query) != required or any(len(v) != 1 for v in query.values()):
                     raise APIError(400, "Missing, duplicate, or unknown query parameter")
                 params = {k: v[0] for k, v in query.items()}
+                ip = self.client_ip()
+                if url.path != "/start":
+                    blocked, retry = self.server.misses.blocked(ip)
+                    if blocked:
+                        raise APIError(429, "Too many requests for unknown transfer IDs; try again later",
+                                       {"Retry-After": str(retry)})
                 # The optional download password travels in a Basic Authorization header, never the URL.
-                result = store.status(params["id"]) if url.path == "/status" else (
-                    store.start(params, self.client_ip(), self.basic_password()) if url.path == "/start"
-                    else store.receive(params))
+                try:
+                    result = store.status(params["id"]) if url.path == "/status" else (
+                        store.start(params, ip, self.basic_password()) if url.path == "/start"
+                        else store.receive(params))
+                except APIError as error:
+                    if error.status == 404 and url.path != "/start":
+                        self.server.misses.miss(ip)
+                    raise
                 self.respond(200, result)
             elif url.path.startswith("/download/"):
                 token = url.path.removeprefix("/download/")
@@ -438,6 +455,7 @@ class Handler(BaseHTTPRequestHandler):
                 assets = {"/": ("web/index.html", "text/html; charset=utf-8"),
                           "/app.js": ("web/app.js", "text/javascript; charset=utf-8"),
                           "/style.css": ("web/style.css", "text/css; charset=utf-8"),
+                          "/words.txt": ("web/words.txt", "text/plain; charset=utf-8"),
                           "/Upload-File.ps1": ("Upload-File.ps1", "text/plain; charset=utf-8"),
                           "/Upload-File.sh": ("Upload-File.sh", "text/plain; charset=utf-8")}
                 if url.path not in assets:
@@ -457,12 +475,44 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(500, {"error": "Internal server error"})
 
 
+class MissLimiter:
+    """Per-IP budget for lookups of unknown transfer IDs, so short word IDs cannot be enumerated.
+
+    The upload page polls /status about 24 times a minute before its script starts,
+    so the default leaves room for several open pages behind one address.
+    """
+
+    def __init__(self, limit, clock, window=60, max_clients=10000):
+        self.limit, self.clock, self.window, self.max_clients = limit, clock, window, max_clients
+        self.counts, self.lock = {}, threading.Lock()
+
+    def _current(self, ip, now):
+        start, count = self.counts.get(ip, (now, 0))
+        return (now, 0) if now - start >= self.window else (start, count)
+
+    def blocked(self, ip):
+        with self.lock:
+            start, count = self._current(ip, self.clock())
+            return count >= self.limit, max(1, math.ceil(start + self.window - self.clock()))
+
+    def miss(self, ip):
+        with self.lock:
+            now = self.clock()
+            if ip not in self.counts and len(self.counts) >= self.max_clients:
+                self.counts = {k: v for k, v in self.counts.items() if now - v[0] < self.window}
+                if len(self.counts) >= self.max_clients:
+                    self.counts.clear()
+            start, count = self._current(ip, now)
+            self.counts[ip] = (start, count + 1)
+
+
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 64
 
-    def __init__(self, address, store, trust_proxy=False):
+    def __init__(self, address, store, trust_proxy=False, miss_limit=120):
         self.store, self.trust_proxy = store, trust_proxy
+        self.misses = MissLimiter(miss_limit, store.clock)
         self.slots = threading.BoundedSemaphore(32)
         super().__init__(address, Handler)
 
@@ -550,7 +600,8 @@ def main(argv=None):
                 logging.exception("Cleanup failed")
 
     threading.Thread(target=janitor, daemon=True).start()
-    server = Server((os.environ.get("HOST", "127.0.0.1"), args.port), store, args.trust_proxy)
+    server = Server((os.environ.get("HOST", "127.0.0.1"), args.port), store, args.trust_proxy,
+                    int(os.environ.get("ID_MISS_LIMIT", "120")))
     logging.info("Upload service listening on %s:%s", *server.server_address)
     try:
         server.serve_forever()

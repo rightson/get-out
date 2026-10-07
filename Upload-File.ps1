@@ -14,13 +14,19 @@ param(
     # Download link lifetime after upload, 0.1 to 24 hours (up to two decimals).
     [Parameter(Mandatory = $true)][ValidateRange(0.1, 24)][decimal]$ExpiresHours,
     [securestring]$DownloadPassword,
-    [ValidatePattern('^[a-f0-9]{32}$')][string]$TransferId = [Guid]::NewGuid().ToString('N'),
+    # Four words from the upload page (for example acorn-tulip-gravy-snore), or 32 hex characters.
+    [string]$TransferId = [Guid]::NewGuid().ToString('N'),
     [ValidateRange(1, 10)][int]$MaxAttempts = 5,
     [switch]$OpenResult
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+# Accept IDs typed by hand in any case, with spaces or other separators between the words.
+$TransferId = ($TransferId.Trim().ToLowerInvariant() -replace '[^a-z0-9]+', '-').Trim('-')
+if ($TransferId -cnotmatch '^(?:[a-f0-9]{32}|[a-z]{3,5}(?:-[a-z]{3,5}){3})$') {
+    throw 'TransferId must be four words joined by hyphens (as shown on the upload page) or 32 hexadecimal characters.'
+}
 Add-Type -AssemblyName System.Net.Http
 # Windows PowerShell uses the machine's TLS settings, with TLS 1.2 also enabled.
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12

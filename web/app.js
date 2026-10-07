@@ -5,10 +5,34 @@ let transferId;
 let seen = false;
 let terminal = false;
 let polling = false;
+const ID_PATTERN = /^(?:[a-f0-9]{32}|[a-z]{3,5}(?:-[a-z]{3,5}){3})$/;
+// Transfer IDs are four words from the server's list; fall back to 128 random bits if it is unavailable.
+const words = fetch(`${baseUrl}/words.txt`, { cache: 'no-store' })
+  .then((r) => (r.ok ? r.text() : Promise.reject(new Error('Word list unavailable'))))
+  .then((text) => text.split(/\s+/).filter(Boolean))
+  .catch(() => null);
 
-function setTransfer() {
-  const candidate = new URLSearchParams(window.location.hash.slice(1)).get('id');
-  transferId = /^[a-f0-9]{32}$/.test(candidate || '') ? candidate : crypto.randomUUID().replaceAll('-', '');
+// Accept IDs typed by hand: any case, with spaces or other separators between the words.
+function normalizeId(value) {
+  return (value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+async function newId() {
+  const list = await words;
+  if (!list || list.length < 2) return crypto.randomUUID().replaceAll('-', '');
+  // Rejection sampling keeps every word equally likely.
+  const limit = 65536 - (65536 % list.length);
+  const value = new Uint16Array(1);
+  const picked = [];
+  while (picked.length < 4) {
+    crypto.getRandomValues(value);
+    if (value[0] < limit) picked.push(list[value[0] % list.length]);
+  }
+  return picked.join('-');
+}
+
+async function setTransfer() {
+  const candidate = normalizeId(new URLSearchParams(window.location.hash.slice(1)).get('id'));
+  transferId = ID_PATTERN.test(candidate) ? candidate : await newId();
   history.replaceState(null, '', `#id=${transferId}`);
   seen = false;
   terminal = false;
@@ -58,7 +82,7 @@ function showError(message) {
   $('result').hidden = true;
 }
 async function poll() {
-  if (polling || terminal) return;
+  if (polling || terminal || !transferId) return;
   polling = true;
   const requestedId = transferId;
   try {
@@ -118,12 +142,11 @@ $('ask-password').addEventListener('change', command);
 $('copy').addEventListener('click', () => copy($('command').value, $('copy')));
 $('copy-shell').addEventListener('click', () => copy($('shell-command').value, $('copy-shell')));
 $('copy-link').addEventListener('click', () => copy($('download-link').value, $('copy-link')));
-$('new-transfer').addEventListener('click', () => {
-  window.location.hash = 'id=' + crypto.randomUUID().replaceAll('-', '');
+$('new-transfer').addEventListener('click', async () => {
+  window.location.hash = 'id=' + await newId();
 });
-window.addEventListener('hashchange', () => { setTransfer(); poll(); });
-setTransfer();
-poll();
+window.addEventListener('hashchange', () => { setTransfer().then(poll); });
+setTransfer().then(poll);
 setInterval(poll, 2500);
 fetch(`${baseUrl}/config`, { cache: 'no-store' }).then((r) => r.json()).then((config) => {
   $('limits').textContent = `${config.chunk_size.toLocaleString()}-byte chunks · Maximum ${(config.max_file_size / 1024 / 1024).toLocaleString()} MiB per file · You choose when the link disappears (${duration(config.min_ttl_hours)} to ${duration(config.max_ttl_hours)})`;
