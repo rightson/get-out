@@ -373,6 +373,46 @@ class ServiceTests(unittest.TestCase):
             process.terminate()
             process.wait(timeout=10)
 
+    def browser_upload(self, source, server_url, *args):
+        self.now = time.time()  # The page compares expiry with the real clock.
+        root = Path(__file__).resolve().parents[1]
+        process = subprocess.run(['node', str(root / 'tests' / 'browser_upload.mjs'), str(root / 'web' / 'app.js'),
+                                  server_url, str(source), *args], capture_output=True, text=True, timeout=60)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        return json.loads(process.stdout)
+
+    @unittest.skipUnless(shutil.which('node'), 'Node.js is not installed')
+    def test_browser_upload_with_and_without_password(self):
+        url = 'http://%s:%s' % self.server.server_address
+        source = Path(self.temp.name) / 'browser résumé.bin'
+        source.write_bytes(os.urandom(5000))
+        for password in (None, 'pä ss'):
+            with self.subTest(password=password):
+                page = self.browser_upload(source, url, *([password] if password else []))
+                self.assertEqual((page['status'], page['error'], page['passwordProtected']),
+                                 ('Uploaded and verified', None, password is not None))
+                path = urlsplit_path(page['downloadLink'])
+                if password:
+                    self.assertEqual(self.request(path)[0], 401)
+                self.assertEqual(self.request(path, headers=password and basic(password))[1], source.read_bytes())
+                status = self.request('/status', {'id': page['transferId']})[1]
+                self.assertEqual((status['name'], status['ttl_hours']), (source.name, 0.5))
+
+    @unittest.skipUnless(shutil.which('node'), 'Node.js is not installed')
+    def test_browser_upload_failures(self):
+        url = 'http://%s:%s' % self.server.server_address
+        large = Path(self.temp.name) / 'large.bin'
+        large.write_bytes(b'x' * 9000)  # Over this test server's 8192-byte limit.
+        page = self.browser_upload(large, url)
+        self.assertIn('size limit', page['error'])
+        self.assertFalse(page['scriptsOpen'])  # A script cannot fix a rejected file.
+        with socket.socket() as probe:
+            probe.bind(('127.0.0.1', 0))
+            unreachable = 'http://127.0.0.1:%d' % probe.getsockname()[1]
+        page = self.browser_upload(large, unreachable)
+        self.assertIn('could not reach the server', page['error'])
+        self.assertTrue(page['scriptsOpen'])  # Network problems point to the script fallback.
+
     def shell_upload(self, source, transfer_id, *, environment=None, attempts=1, extra=(), stdin=None, password=None,
                      expected_id=None):
         script = Path(__file__).resolve().parents[1] / 'Upload-File.sh'

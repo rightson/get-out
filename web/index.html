@@ -10,32 +10,45 @@
 <body>
   <main>
     <header><span class="mark" aria-hidden="true">↗</span><span>LET'S ESCAPE</span><span class="pill" id="pill">Temporary file transfer</span></header>
-    <div class="intro"><p class="eyebrow">A small route for your files</p><h1>Send it in pieces.<br>Get it back whole.</h1><p class="lead">Upload from PowerShell or your terminal with acknowledged GET requests. Your download link appears here once every chunk is verified.</p></div>
+    <div class="intro"><p class="eyebrow">A small route for your files</p><h1>Send it in pieces.<br>Get it back whole.</h1><p class="lead">Upload from this page with acknowledged GET requests, or use a PowerShell or terminal script if your browser can't. Your download link appears here once every chunk is verified.</p></div>
     <section class="card" aria-labelledby="upload-title">
       <div class="section-top"><h2 id="upload-title">Start a transfer</h2><span class="step">01 — UPLOAD</span></div>
-      <p>Download a script, enter your file's local path, then run the matching command.</p>
-      <div class="script-downloads">
-        <a class="button secondary" href="Upload-File.ps1" download>↓ PowerShell script</a>
-        <a class="button secondary" href="Upload-File.sh" download>↓ Bash / POSIX sh script</a>
-      </div>
-      <label for="file-path">File path on your computer</label>
-      <input id="file-path" type="text" placeholder="C:\Users\you\Downloads\report.zip" autocomplete="off" spellcheck="false">
+      <label for="file">File</label>
+      <input id="file" type="file">
       <label for="expires-hours">Link disappears after (hours, 0.1–24)</label>
       <input id="expires-hours" type="number" min="0.1" max="24" step="0.1" value="1" inputmode="decimal">
-      <label class="check"><input id="ask-password" type="checkbox"> Require a download password (the script asks for it; it never appears in the command)</label>
-      <div class="command-top"><label for="command">PowerShell — run from the script's folder</label><button id="copy" type="button">Copy command</button></div>
-      <textarea id="command" rows="4" readonly aria-label="PowerShell upload command"></textarea>
-      <p class="hint">On Windows, run <code>Unblock-File .\Upload-File.ps1</code> after downloading it. Your PowerShell execution policy must permit scripts.</p>
-      <div class="command-top"><label for="shell-command">Bash / POSIX sh — run from the script's folder</label><button id="copy-shell" type="button">Copy command</button></div>
-      <textarea id="shell-command" rows="4" readonly aria-label="POSIX shell upload command"></textarea>
-      <p class="hint">For Linux and macOS. Requires <code>curl</code>, <code>jq</code>, <code>base64</code>, and a SHA-256 tool. Use your file's Linux or macOS path above.</p>
+      <label class="check"><input id="ask-password" type="checkbox"> Require a download password</label>
+      <div id="password-fields" hidden>
+        <label for="password">Download password</label>
+        <input id="password" type="password" autocomplete="new-password" maxlength="128">
+        <label for="password-confirm">Confirm password</label>
+        <input id="password-confirm" type="password" autocomplete="new-password" maxlength="128">
+      </div>
+      <button id="upload" class="button" type="button">↑ Upload</button>
+      <p id="upload-error" class="hint error-text" role="alert" hidden></p>
+      <details id="scripts">
+        <summary>Browser can't upload? Use a script instead</summary>
+        <p>Download a script, enter your file's local path, then run the matching command. It uses the same transfer ID, expiry, and password setting as above, so it can finish an upload the browser started.</p>
+        <div class="script-downloads">
+          <a class="button secondary" href="Upload-File.ps1" download>↓ PowerShell script</a>
+          <a class="button secondary" href="Upload-File.sh" download>↓ Bash / POSIX sh script</a>
+        </div>
+        <label for="file-path">File path on your computer</label>
+        <input id="file-path" type="text" placeholder="C:\Users\you\Downloads\report.zip" autocomplete="off" spellcheck="false">
+        <div class="command-top"><label for="command">PowerShell — run from the script's folder</label><button id="copy" type="button">Copy command</button></div>
+        <textarea id="command" rows="4" readonly aria-label="PowerShell upload command"></textarea>
+        <p class="hint">On Windows, run <code>Unblock-File .\Upload-File.ps1</code> after downloading it. Your PowerShell execution policy must permit scripts. If a password is required, the script asks for it; it never appears in the command.</p>
+        <div class="command-top"><label for="shell-command">Bash / POSIX sh — run from the script's folder</label><button id="copy-shell" type="button">Copy command</button></div>
+        <textarea id="shell-command" rows="4" readonly aria-label="POSIX shell upload command"></textarea>
+        <p class="hint">For Linux and macOS. Requires <code>curl</code>, <code>jq</code>, <code>base64</code>, and a SHA-256 tool. Use your file's Linux or macOS path above.</p>
+      </details>
       <div class="transfer-line"><span>Transfer ID</span><code id="transfer-id"></code><button id="new-transfer" type="button">New transfer</button></div>
     </section>
     <section class="card" aria-labelledby="result-title">
       <div class="section-top"><h2 id="result-title">Your file's journey</h2><span class="step">02 — DOWNLOAD</span></div>
-      <div class="status-line"><span id="status-dot" class="dot"></span><strong id="status" role="status" aria-live="polite">Waiting for your script</strong></div>
+      <div class="status-line"><span id="status-dot" class="dot"></span><strong id="status" role="status" aria-live="polite">Waiting for an upload</strong></div>
       <progress id="progress" max="100" value="0" aria-label="Acknowledged chunks"></progress>
-      <p id="detail">Keep this page open while the script uploads. Interrupted uploads can resume with the same transfer ID.</p>
+      <p id="detail">Keep this page open while the file uploads. Interrupted uploads can resume with the same transfer ID.</p>
       <div id="result" hidden>
         <p id="filename" class="filename"></p>
         <a id="download" class="button" href="#">↓ Download verified file</a>

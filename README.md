@@ -1,6 +1,6 @@
 # Let's Escape
 
-A file upload service that carries **1 KiB raw chunks in HTTP GET query parameters**. It includes PowerShell and POSIX shell clients and an upload page that shows progress and a shareable download link. The server verifies the whole-file SHA-256 before making a download available. The uploader chooses when the link disappears (**0.1 to 24 hours after verification**) and can require a **download password**. At expiry the link stops working and the file is deleted. The server keeps an audit log of uploads and download-link visits (see [Audit log](#audit-log)).
+A file upload service that carries **1 KiB raw chunks in HTTP GET query parameters**. The upload page sends files straight from the browser, shows progress, and gives a shareable download link; PowerShell and POSIX shell clients are the fallback when a browser can't upload. The server verifies the whole-file SHA-256 before making a download available. The uploader chooses when the link disappears (**0.1 to 24 hours after verification**) and can require a **download password**. At expiry the link stops working and the file is deleted. The server keeps an audit log of uploads and download-link visits (see [Audit log](#audit-log)).
 
 ## Run locally
 
@@ -15,7 +15,13 @@ python3 server.py audit        # print upload and download history
 
 `--port`, `--max-file-mb` (default 10 MiB), and `--trust-proxy` override the `PORT`, `MAX_FILE_MB`, and `TRUST_PROXY` environment variables. `--watch` runs the server in a child process and restarts it within about a second of a change to `server.py`; the web page and client scripts are read on each request, so they never need a restart.
 
-Open `http://localhost:8080`, download `Upload-File.ps1`, enter a local file path, and copy the generated command. The page tracks that transfer while PowerShell sends the chunks. The script can also run directly in Windows PowerShell 5.1 or PowerShell 7:
+Open `http://localhost:8080`, choose a file, set when the link disappears and an optional download password, and select **Upload**. The browser reads the file with the File API, computes its SHA-256 with Web Crypto, and sends chunks with the same GET protocol as the scripts (four requests in flight, with the scripts' retry policy). No local path is needed: browsers never reveal one. Web Crypto requires HTTPS (or `localhost`), and the whole file is read into memory, which is fine within the file-size limit.
+
+If the browser can't upload (the network blocks it, retries run out, or the page isn't served over HTTPS), the page opens **Browser can't upload? Use a script instead** and explains why. The generated commands use the same transfer ID, expiry, and password setting, so a script resumes whatever the browser already sent. Rejections a script can't fix, such as an oversized file, don't open it.
+
+## PowerShell client
+
+Download `Upload-File.ps1` from the page, enter the file's local path, and copy the generated command. The page tracks that transfer while PowerShell sends the chunks. The script can also run directly in Windows PowerShell 5.1 or PowerShell 7:
 
 ```powershell
 Unblock-File .\Upload-File.ps1
@@ -36,7 +42,7 @@ Both clients request missing sequences, retry network failures and HTTP 408/429/
 
 ## Bash / POSIX shell client
 
-The upload page provides `Upload-File.sh` beside the PowerShell download, with a generated command for each. The shell script uses POSIX `sh` syntax and runs under `sh`, `dash`, or Bash on Linux and macOS; Bash-specific features are not required. Dependencies: `curl`, `jq`, `base64`, standard shell utilities, and one of `sha256sum`, `shasum`, or `openssl`. Run without `--transfer-id`, it uses `/dev/urandom` to generate a 32-character hex ID. Install `jq` if needed (for example, `sudo apt install jq` or `brew install jq`).
+The upload page's script section provides `Upload-File.sh` beside the PowerShell download, with a generated command for each. The shell script uses POSIX `sh` syntax and runs under `sh`, `dash`, or Bash on Linux and macOS; Bash-specific features are not required. Dependencies: `curl`, `jq`, `base64`, standard shell utilities, and one of `sha256sum`, `shasum`, or `openssl`. Run without `--transfer-id`, it uses `/dev/urandom` to generate a 32-character hex ID. Install `jq` if needed (for example, `sudo apt install jq` or `brew install jq`).
 
 ```sh
 sh ./Upload-File.sh --server-url http://localhost:8080 --path './report.zip' --expires-hours 1 --open-result
@@ -151,4 +157,4 @@ python3 -m unittest discover -s tests -v
 node --check web/app.js
 ```
 
-The tests use a live HTTP server and cover out-of-order chunks, duplicate/conflicting retries, concurrent requests, resume after restart, zero-byte files, SHA-256 failure, URL/input limits, HEAD behavior, uploader-chosen expiry and cleanup, download passwords, the audit log and proxy IP handling, `--watch` restarts, capacity limits, and response headers. With `sh`, `curl`, and `jq` installed, they also exercise the actual shell client, including binary/empty files, partial resume, completed retries, lost acknowledgments, and a password read from stdin. With `pwsh` installed, they run the PowerShell uploader with a download password, resume a partially uploaded binary file, rerun a completed upload, and compare downloaded bytes. CI requires the client dependencies and builds the container too.
+The tests use a live HTTP server and cover out-of-order chunks, duplicate/conflicting retries, concurrent requests, resume after restart, zero-byte files, SHA-256 failure, URL/input limits, HEAD behavior, uploader-chosen expiry and cleanup, download passwords, the audit log and proxy IP handling, `--watch` restarts, capacity limits, and response headers. With Node.js installed, they load `web/app.js` against a minimal DOM stub (`tests/browser_upload.mjs`) and run real browser uploads with and without a password, plus the oversized-file and unreachable-server fallbacks. With `sh`, `curl`, and `jq` installed, they also exercise the actual shell client, including binary/empty files, partial resume, completed retries, lost acknowledgments, and a password read from stdin. With `pwsh` installed, they run the PowerShell uploader with a download password, resume a partially uploaded binary file, rerun a completed upload, and compare downloaded bytes. CI requires the client dependencies and builds the container too.
