@@ -8,10 +8,11 @@ services:
       - uploads:/data
     environment:
       CHUNK_SIZE: "1024"
-      MAX_FILE_BYTES: "26214400"
+      MAX_FILE_MB: "10"
       MAX_STORAGE_BYTES: "1073741824"
       MAX_TRANSFERS: "100"
-      TTL_HOURS: "1"
+      # Nginx on the host sets X-Real-IP; the published port listens on loopback only.
+      TRUST_PROXY: "1"
     read_only: true
     security_opt:
       - no-new-privileges:true

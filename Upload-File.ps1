@@ -3,14 +3,17 @@
 .SYNOPSIS
 Upload a file using acknowledged, resumable Base64URL GET requests.
 .EXAMPLE
-.\Upload-File.ps1 -ServerUrl https://upload.example.com -Path .\report.zip -OpenResult
+.\Upload-File.ps1 -ServerUrl https://upload.example.com -Path .\report.zip -ExpiresHours 1 -OpenResult
 .EXAMPLE
-.\Upload-File.ps1 -ServerUrl https://upload.example.com -Path .\report.zip -TransferId 0123456789abcdef0123456789abcdef
+.\Upload-File.ps1 -ServerUrl https://upload.example.com -Path .\report.zip -ExpiresHours 0.5 -DownloadPassword (Read-Host 'Download password' -AsSecureString)
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$ServerUrl,
     [Parameter(Mandatory = $true)][string]$Path,
+    # Download link lifetime after upload, 0.1 to 24 hours (up to two decimals).
+    [Parameter(Mandatory = $true)][ValidateRange(0.1, 24)][decimal]$ExpiresHours,
+    [securestring]$DownloadPassword,
     [ValidatePattern('^[a-f0-9]{32}$')][string]$TransferId = [Guid]::NewGuid().ToString('N'),
     [ValidateRange(1, 10)][int]$MaxAttempts = 5,
     [switch]$OpenResult
@@ -36,21 +39,33 @@ $client = [Net.Http.HttpClient]::new($handler)
 $client.Timeout = [TimeSpan]::FromSeconds(60)
 $client.DefaultRequestHeaders.TryAddWithoutValidation('Cache-Control', 'no-store, no-cache') | Out-Null
 $client.DefaultRequestHeaders.TryAddWithoutValidation('Pragma', 'no-cache') | Out-Null
+if ([decimal]::Round($ExpiresHours, 2) -ne $ExpiresHours) { throw 'ExpiresHours allows at most two decimal places.' }
+$startAuthorization = $null
+if ($null -ne $DownloadPassword) {
+    $plain = [Net.NetworkCredential]::new('', $DownloadPassword).Password
+    if ($plain.Length -lt 1 -or $plain.Length -gt 128) { throw 'DownloadPassword must be 1 to 128 characters.' }
+    # Sent once to /start in a header, never in the URL; the server stores only a scrypt hash.
+    $startAuthorization = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(':' + $plain))
+    Remove-Variable plain
+}
 $stream = $null
 $hasher = $null
 
 function Invoke-UploadGet {
-    param([string]$Endpoint, [hashtable]$Parameters)
+    param([string]$Endpoint, [hashtable]$Parameters, [string]$Authorization)
     $pairs = foreach ($key in ($Parameters.Keys | Sort-Object)) {
         [Uri]::EscapeDataString([string]$key) + '=' + [Uri]::EscapeDataString([string]$Parameters[$key])
     }
     $uri = $baseUrl + $Endpoint + '?' + ($pairs -join '&')
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         $response = $null
+        $request = $null
         $retry = $true
         $failure = 'No acknowledgment from the server.'
         try {
-            $response = $client.GetAsync($uri).GetAwaiter().GetResult()
+            $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, $uri)
+            if ($Authorization) { $request.Headers.TryAddWithoutValidation('Authorization', $Authorization) | Out-Null }
+            $response = $client.SendAsync($request).GetAwaiter().GetResult()
             $statusCode = [int]$response.StatusCode
             if ($response.IsSuccessStatusCode) {
                 return ($response.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json)
@@ -64,6 +79,7 @@ function Invoke-UploadGet {
         }
         finally {
             if ($null -ne $response) { $response.Dispose() }
+            if ($null -ne $request) { $request.Dispose() }
         }
         if (-not $retry -or $attempt -eq $MaxAttempts) { throw $failure }
         Start-Sleep -Milliseconds ([int]([Math]::Min(8000, 500 * [Math]::Pow(2, $attempt - 1)) + (Get-Random -Minimum 0 -Maximum 250)))
@@ -82,7 +98,8 @@ try {
     Write-Host 'Keep this ID to resume an interrupted upload of the same file.'
     $transfer = Invoke-UploadGet '/start' @{
         id = $TransferId; name = [IO.Path]::GetFileName($resolved); size = $size; sha256 = $digest
-    }
+        ttl_hours = $ExpiresHours.ToString([Globalization.CultureInfo]::InvariantCulture)
+    } $startAuthorization
     $chunkSize = [int]$transfer.chunk_size
     if ($chunkSize -lt 64 -or $chunkSize -gt 1024 -or $transfer.id -ne $TransferId) {
         throw 'Server returned invalid transfer metadata.'
@@ -127,6 +144,7 @@ try {
         DownloadUrl = $downloadUrl
         ResultPage = $resultUrl
         ExpiresUtc = [DateTimeOffset]::FromUnixTimeSeconds([long][Math]::Floor($transfer.expires)).UtcDateTime
+        PasswordProtected = [bool]$transfer.password_protected
         SHA256 = $digest
     }
 }

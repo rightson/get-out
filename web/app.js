@@ -5,7 +5,6 @@ let transferId;
 let seen = false;
 let terminal = false;
 let polling = false;
-let ttlText = '';
 
 function setTransfer() {
   const candidate = new URLSearchParams(window.location.hash.slice(1)).get('id');
@@ -24,11 +23,24 @@ function setTransfer() {
 
 function psQuote(value) { return "'" + value.replaceAll("'", "''") + "'"; }
 function shQuote(value) { return "'" + value.replaceAll("'", "'\"'\"'") + "'"; }
+function expiresHours() {
+  // Match the server: 0.1 to 24 hours with at most two decimals.
+  const hours = Math.round(Number($('expires-hours').value) * 100) / 100;
+  return Number.isFinite(hours) ? Math.min(24, Math.max(0.1, hours)) : 1;
+}
 function command() {
+  const hours = expiresHours();
+  const ask = $('ask-password').checked;
   const filePath = $('file-path').value || 'C:\\path\\to\\your-file.zip';
-  $('command').value = `.\\Upload-File.ps1 -ServerUrl ${psQuote(baseUrl)} -Path ${psQuote(filePath)} -TransferId ${psQuote(transferId)} -OpenResult`;
+  $('command').value = `.\\Upload-File.ps1 -ServerUrl ${psQuote(baseUrl)} -Path ${psQuote(filePath)} -TransferId ${psQuote(transferId)} -ExpiresHours ${hours}`
+    + (ask ? " -DownloadPassword (Read-Host 'Download password' -AsSecureString)" : '') + ' -OpenResult';
   const shellPath = $('file-path').value || '/path/to/your-file.zip';
-  $('shell-command').value = `sh ./Upload-File.sh --server-url ${shQuote(baseUrl)} --path ${shQuote(shellPath)} --transfer-id ${shQuote(transferId)} --open-result`;
+  $('shell-command').value = `sh ./Upload-File.sh --server-url ${shQuote(baseUrl)} --path ${shQuote(shellPath)} --transfer-id ${shQuote(transferId)} --expires-hours ${hours}`
+    + (ask ? ' --ask-password' : '') + ' --open-result';
+}
+function duration(hours) {
+  const minutes = Math.round(hours * 60);
+  return minutes < 60 ? `${minutes} minutes` : `${+(minutes / 60).toFixed(2)} hour${minutes === 60 ? '' : 's'}`;
 }
 async function copy(text, button) {
   try {
@@ -82,7 +94,8 @@ async function poll() {
       const downloadUrl = baseUrl + upload.download_url;
       $('download').href = downloadUrl;
       $('download-link').value = downloadUrl;
-      $('expires').textContent = `Available until ${expiration.toLocaleString()}${ttlText && ` (${ttlText} after upload)`}.`;
+      $('expires').textContent = `Available until ${expiration.toLocaleString()} (${duration(upload.ttl_hours)} after upload). The file is then deleted.`;
+      $('password-note').hidden = !upload.password_protected;
       $('checksum').textContent = upload.sha256;
       $('result').hidden = false;
       // Keep checking expiry so a tab left open does not advertise an expired link.
@@ -100,6 +113,8 @@ async function poll() {
 }
 
 $('file-path').addEventListener('input', command);
+$('expires-hours').addEventListener('input', command);
+$('ask-password').addEventListener('change', command);
 $('copy').addEventListener('click', () => copy($('command').value, $('copy')));
 $('copy-shell').addEventListener('click', () => copy($('shell-command').value, $('copy-shell')));
 $('copy-link').addEventListener('click', () => copy($('download-link').value, $('copy-link')));
@@ -111,8 +126,5 @@ setTransfer();
 poll();
 setInterval(poll, 2500);
 fetch(`${baseUrl}/config`, { cache: 'no-store' }).then((r) => r.json()).then((config) => {
-  const minutes = Math.round(config.ttl_seconds / 60);
-  ttlText = minutes < 60 ? `${minutes} minutes` : `${+(minutes / 60).toFixed(1)} hour${minutes === 60 ? '' : 's'}`;
-  $('pill').textContent = `${ttlText.replace(/s$/, '').replace(' ', '-')} file transfer`;
-  $('limits').textContent = `${config.chunk_size.toLocaleString()}-byte chunks · Maximum ${(config.max_file_size / 1024 / 1024).toLocaleString()} MiB per file · Downloads expire in ${ttlText}`;
+  $('limits').textContent = `${config.chunk_size.toLocaleString()}-byte chunks · Maximum ${(config.max_file_size / 1024 / 1024).toLocaleString()} MiB per file · You choose when the link disappears (${duration(config.min_ttl_hours)} to ${duration(config.max_ttl_hours)})`;
 }).catch(() => {});

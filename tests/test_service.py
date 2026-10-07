@@ -2,18 +2,28 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import http.client
+import io
 import json
 import os
 from pathlib import Path
 import secrets
 import shutil
+import socket
 import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
 from urllib.parse import urlencode
 
-from server import Server, Store, TTL
+from server import MAX_TTL, MIN_TTL, UPLOAD_WINDOW, Server, Store, audit_report
+
+HOUR = 60 * 60
+
+
+def basic(password):
+    return {'Authorization': 'Basic ' + base64.b64encode((':' + password).encode()).decode()}
 
 
 class ServiceTests(unittest.TestCase):
@@ -31,12 +41,12 @@ class ServiceTests(unittest.TestCase):
         self.thread.join()
         self.temp.cleanup()
 
-    def request(self, path, params=None, method='GET'):
+    def request(self, path, params=None, method='GET', headers=None):
         if params is not None:
             path += '?' + urlencode(params)
         conn = http.client.HTTPConnection(*self.server.server_address, timeout=5)
         try:
-            conn.request(method, path)
+            conn.request(method, path, headers=headers or {})
             response = conn.getresponse()
             body = response.read()
             headers = dict(response.getheaders())
@@ -46,10 +56,11 @@ class ServiceTests(unittest.TestCase):
         finally:
             conn.close()
 
-    def start(self, data, name='example.bin', digest=None, transfer_id=None):
+    def start(self, data, name='example.bin', digest=None, transfer_id=None, ttl_hours='1', password=None):
         transfer_id = transfer_id or secrets.token_hex(16)
-        params = dict(id=transfer_id, name=name, size=len(data), sha256=digest or hashlib.sha256(data).hexdigest())
-        status, body, _ = self.request('/start', params)
+        params = dict(id=transfer_id, name=name, size=len(data), sha256=digest or hashlib.sha256(data).hexdigest(),
+                      ttl_hours=ttl_hours)
+        status, body, _ = self.request('/start', params, headers=password and basic(password))
         self.assertEqual(status, 200, body)
         return body, params
 
@@ -82,7 +93,7 @@ class ServiceTests(unittest.TestCase):
             status, result, _ = self.request('/receive', self.chunk(transfer, data, seq))
             self.assertEqual(status, 200)
         self.assertEqual(result['state'], 'complete')
-        self.assertEqual(result['expires'], self.now + TTL)
+        self.assertEqual(result['expires'], self.now + HOUR)
         self.assertNotIn(transfer['id'], result['download_url'])
         status, downloaded, headers = self.request(result['download_url'])
         self.assertEqual((status, downloaded), (200, data))
@@ -113,6 +124,7 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.request('/receive', params)[0], 422)
         with self.store.connect() as conn:
             self.assertEqual(conn.execute('SELECT COUNT(*) FROM chunks').fetchone()[0], 0)
+            self.assertEqual(conn.execute('SELECT state FROM upload_log').fetchone()[0], 'failed')
 
     def test_strict_input_url_limit_and_head_has_no_side_effects(self):
         data = b'x' * 1024
@@ -141,12 +153,13 @@ class ServiceTests(unittest.TestCase):
         self.request('/receive', self.chunk(transfer, data, 0))
         self.server.store = Store(self.temp.name, clock=lambda: self.now)
         self.assertEqual(self.request('/status', {'id': transfer['id']})[1]['missing'], [1])
-        self.now += TTL - 10
+        self.assertEqual(transfer['expires'], self.now + UPLOAD_WINDOW)
+        self.now += UPLOAD_WINDOW - 10
         result = self.request('/receive', self.chunk(transfer, data, 1))[1]
-        self.assertEqual(result['expires'], self.now + TTL)
+        self.assertEqual(result['expires'], self.now + HOUR)
         self.server.store = Store(self.temp.name, clock=lambda: self.now)
         self.assertEqual(self.request(result['download_url'])[1], data)
-        self.now += TTL
+        self.now += HOUR
         self.assertEqual(self.request(result['download_url'])[0], 410)
         self.assertEqual(self.request('/status', {'id': transfer['id']})[0], 410)
         self.server.store.cleanup()
@@ -156,17 +169,20 @@ class ServiceTests(unittest.TestCase):
     def test_abandoned_transfers_expire_and_free_capacity(self):
         transfer, _ = self.start(b'pending')
         self.server.store.max_transfers = 1
-        other = dict(id=secrets.token_hex(16), name='other', size=0, sha256=hashlib.sha256(b'').hexdigest())
+        other = dict(id=secrets.token_hex(16), name='other', size=0, sha256=hashlib.sha256(b'').hexdigest(), ttl_hours='1')
         self.assertEqual(self.request('/start', other)[0], 503)
-        self.now += TTL
+        self.now += UPLOAD_WINDOW
         self.assertEqual(self.request('/receive', self.chunk(transfer, b'pending', 0))[0], 410)
         self.server.store.cleanup()
         self.assertEqual(self.request('/start', other)[0], 200)
+        with self.store.connect() as conn:
+            states = [r[0] for r in conn.execute('SELECT state FROM upload_log ORDER BY started, rowid')]
+        self.assertEqual(states, ['abandoned', 'uploading'])
 
     def test_storage_reservations_and_orphan_cleanup(self):
         self.server.store.max_storage = 1024
         self.start(b'x' * 1024)
-        params = dict(id=secrets.token_hex(16), name='other', size=1, sha256=hashlib.sha256(b'x').hexdigest())
+        params = dict(id=secrets.token_hex(16), name='other', size=1, sha256=hashlib.sha256(b'x').hexdigest(), ttl_hours='1')
         self.assertEqual(self.request('/start', params)[0], 503)
         (self.store.files / 'orphan.tmp').write_bytes(b'incomplete')
         self.store.cleanup()
@@ -206,18 +222,123 @@ class ServiceTests(unittest.TestCase):
                     self.assertIn(asset[1:], headers['Content-Disposition'])
         self.assertEqual(self.request('/../server.py')[0], 404)
         self.assertEqual(self.request('/download/' + 'x' * 64)[0], 404)
-        self.assertEqual(self.request('/config')[1]['ttl_seconds'], TTL)
+        config = self.request('/config')[1]
+        self.assertEqual((config['min_ttl_hours'], config['max_ttl_hours']), (MIN_TTL / HOUR, MAX_TTL / HOUR))
 
-    def test_configurable_expiry(self):
-        store = Store(self.temp.name, ttl=6 * 60, clock=lambda: self.now)
-        self.server.store = store
-        transfer, _ = self.start(b'')
-        self.assertEqual(transfer['expires'], self.now + 6 * 60)
-        for ttl in (6 * 60 - 1, 24 * 60 * 60 + 1):
-            with self.subTest(ttl=ttl), self.assertRaises(ValueError):
-                Store(self.temp.name, ttl=ttl)
+    def test_default_file_limit_is_10_mib(self):
+        self.assertEqual(Store(self.temp.name).max_file, 10 * 1024**2)
 
-    def shell_upload(self, source, transfer_id, *, environment=None, attempts=1):
+    def test_uploader_chooses_expiry(self):
+        transfer, params = self.start(b'x', ttl_hours='0.1')
+        self.assertEqual(transfer['ttl_hours'], 0.1)
+        result = self.request('/receive', self.chunk(transfer, b'x', 0))[1]
+        self.assertEqual(result['expires'], self.now + 6 * 60)
+        self.assertEqual(self.request('/start', {**params, 'ttl_hours': '2'})[0], 409)
+        for bad in ('0.09', '24.01', '25', '1.234', '01', 'abc', '', '1e1'):
+            with self.subTest(ttl_hours=bad):
+                self.assertEqual(self.request('/start', {**params, 'id': secrets.token_hex(16), 'ttl_hours': bad})[0], 400)
+        self.assertEqual(self.start(b'', ttl_hours='24')[0]['ttl_hours'], 24)
+        no_ttl = {k: v for k, v in params.items() if k != 'ttl_hours'}
+        self.assertEqual(self.request('/start', no_ttl)[0], 400)
+
+    def test_download_password(self):
+        data = b'secret bytes'
+        transfer, params = self.start(data, password='pässwörd')
+        self.assertTrue(transfer['password_protected'])
+        # Resuming must present the same password.
+        self.assertEqual(self.request('/start', params)[0], 409)
+        self.assertEqual(self.request('/start', params, headers=basic('other'))[0], 409)
+        self.assertEqual(self.request('/start', params, headers=basic('pässwörd'))[0], 200)
+        url = self.request('/receive', self.chunk(transfer, data, 0))[1]['download_url']
+        status, _, headers = self.request(url)
+        self.assertEqual(status, 401)
+        self.assertIn('Basic', headers['WWW-Authenticate'])
+        self.assertEqual(self.request(url, headers=basic('wrong'))[0], 401)
+        self.assertEqual(self.request(url, headers={'Authorization': 'Basic !!!'})[0], 400)
+        self.assertEqual(self.request(url, headers=basic('pässwörd'))[1], data)
+        with self.store.connect() as conn:
+            stored = conn.execute('SELECT password FROM transfers').fetchone()[0]
+        self.assertNotIn('pässwörd', stored)
+        fresh = {**params, 'id': secrets.token_hex(16)}
+        self.assertEqual(self.request('/start', fresh, headers=basic('x' * 129))[0], 400)
+        self.assertEqual(self.request('/start', fresh, headers=basic(''))[0], 400)
+
+    def test_audit_log_outlives_deleted_files(self):
+        self.server.trust_proxy = True
+        data = b'audited'
+        transfer, _ = self.start(data, password='pw')
+        url = self.request('/receive', self.chunk(transfer, data, 0))[1]['download_url']
+        self.request(url, headers={'X-Real-IP': '203.0.113.7', 'User-Agent': 'probe'})
+        self.request(url, headers={'X-Real-IP': '203.0.113.7', **basic('nope')})
+        self.request(url, headers={'X-Real-IP': '198.51.100.2', **basic('pw')})
+        self.request(url, headers={'X-Real-IP': '198.51.100.2', **basic('pw')})
+        self.request('/download/' + secrets.token_hex(32))  # Unknown tokens are not logged.
+        self.now += HOUR
+        self.request(url, headers=basic('pw'))
+        self.store.cleanup()
+        self.assertEqual(list(self.store.files.iterdir()), [])
+        self.assertEqual(self.request(url, headers=basic('pw'))[0], 404)
+        with self.store.connect() as conn:
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM transfers').fetchone()[0], 0)
+            upload = conn.execute('SELECT * FROM upload_log').fetchone()
+            accesses = [tuple(r) for r in conn.execute('SELECT ip, result, user_agent FROM access_log ORDER BY rowid')]
+        self.assertEqual((upload['transfer_id'], upload['ip'], upload['name'], upload['size'], upload['state'], upload['password']),
+                         (transfer['id'], '127.0.0.1', 'example.bin', len(data), 'complete', 1))
+        self.assertEqual(upload['deleted'], self.now)
+        self.assertEqual(accesses, [
+            ('203.0.113.7', 'password_required', 'probe'), ('203.0.113.7', 'wrong_password', ''),
+            ('198.51.100.2', 'downloaded', ''), ('198.51.100.2', 'downloaded', ''),
+            ('127.0.0.1', 'expired', ''), ('127.0.0.1', 'not_found', '')])
+        report = io.StringIO()
+        audit_report(self.temp.name, report)
+        line = next(l for l in report.getvalue().splitlines() if l.split('\t')[2:3] == [transfer['id']])
+        self.assertTrue(line.endswith('\t6\t2'), line)
+        self.assertIn('203.0.113.7\twrong_password', report.getvalue())
+
+    def test_client_ip_ignores_proxy_header_unless_trusted(self):
+        self.request('/start', dict(id=secrets.token_hex(16), name='a', size=0,
+                                    sha256=hashlib.sha256(b'').hexdigest(), ttl_hours='1'),
+                     headers={'X-Real-IP': '203.0.113.9'})
+        with self.store.connect() as conn:
+            self.assertEqual(conn.execute('SELECT ip FROM upload_log').fetchone()[0], '127.0.0.1')
+
+    def test_watch_restarts_server_when_source_changes(self):
+        work = Path(self.temp.name) / 'watched'
+        work.mkdir()
+        source = work / 'server.py'
+        shutil.copy(Path(__file__).resolve().parents[1] / 'server.py', source)
+        with socket.socket() as probe:
+            probe.bind(('127.0.0.1', 0))
+            port = probe.getsockname()[1]
+        env = {**os.environ, 'DATA_DIR': str(work / 'data')}
+        process = subprocess.Popen([sys.executable, str(source), '--watch', '--port', str(port)], env=env,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        def health():
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                conn = http.client.HTTPConnection('127.0.0.1', port, timeout=1)
+                try:
+                    conn.request('GET', '/health')
+                    return json.loads(conn.getresponse().read())['status']
+                except OSError:
+                    time.sleep(0.2)
+                finally:
+                    conn.close()
+            self.fail('watched server did not respond')
+
+        try:
+            self.assertEqual(health(), 'ok')
+            source.write_text(source.read_text().replace('{"status": "ok"}', '{"status": "reloaded"}'))
+            deadline = time.time() + 15
+            while health() != 'reloaded':
+                self.assertLess(time.time(), deadline)
+                time.sleep(0.2)
+        finally:
+            process.terminate()
+            process.wait(timeout=10)
+
+    def shell_upload(self, source, transfer_id, *, environment=None, attempts=1, extra=(), stdin=None, password=None):
         script = Path(__file__).resolve().parents[1] / 'Upload-File.sh'
         url = 'http://%s:%s' % self.server.server_address
         env = dict(os.environ)
@@ -225,14 +346,16 @@ class ServiceTests(unittest.TestCase):
         if environment:
             env.update(environment)
         process = subprocess.run([shutil.which('dash') or 'sh', str(script), '--server-url', url,
-                                  '--path', str(source), '--transfer-id', transfer_id,
-                                  '--max-attempts', str(attempts)], capture_output=True, text=True,
-                                 env=env, timeout=45)
+                                  '--path', str(source), '--transfer-id', transfer_id, '--expires-hours', '1',
+                                  '--max-attempts', str(attempts), *extra], capture_output=True, text=True,
+                                 env=env, timeout=45, input=stdin)
         self.assertEqual(process.returncode, 0, process.stderr)
         result = json.loads(process.stdout)
         self.assertEqual(result['TransferId'], transfer_id)
         self.assertEqual(result['SHA256'], hashlib.sha256(source.read_bytes()).hexdigest())
-        self.assertEqual(self.request(urlsplit_path(result['DownloadUrl']))[1], source.read_bytes())
+        self.assertEqual(result['PasswordProtected'], password is not None)
+        self.assertEqual(self.request(urlsplit_path(result['DownloadUrl']), headers=password and basic(password))[1],
+                         source.read_bytes())
         return process, result
 
     @unittest.skipUnless(all(shutil.which(t) for t in ('sh', 'curl', 'jq', 'base64')), 'Shell client dependencies are not installed')
@@ -246,16 +369,33 @@ class ServiceTests(unittest.TestCase):
         self.shell_upload(source, transfer['id'])
 
     @unittest.skipUnless(all(shutil.which(t) for t in ('sh', 'curl', 'jq', 'base64')), 'Shell client dependencies are not installed')
-    def test_posix_shell_empty_file_and_generated_id(self):
+    def test_posix_shell_empty_file_generated_id_and_expiry_validation(self):
         source = Path(self.temp.name) / 'empty.bin'
         source.write_bytes(b'')
         self.shell_upload(source, secrets.token_hex(16))
         script = Path(__file__).resolve().parents[1] / 'Upload-File.sh'
         env = {**os.environ, 'NO_PROXY': '127.0.0.1,localhost'}
-        process = subprocess.run(['sh', str(script), '--server-url', 'http://%s:%s' % self.server.server_address,
-                                  '--path', str(source)], env=env, capture_output=True, text=True, timeout=30)
+        url = 'http://%s:%s' % self.server.server_address
+        process = subprocess.run(['sh', str(script), '--server-url', url, '--path', str(source), '--expires-hours', '0.5'],
+                                 env=env, capture_output=True, text=True, timeout=30)
         self.assertEqual(process.returncode, 0, process.stderr)
         self.assertRegex(json.loads(process.stdout)['TransferId'], r'^[a-f0-9]{32}$')
+        missing = subprocess.run(['sh', str(script), '--server-url', url, '--path', str(source)],
+                                 env=env, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(missing.returncode, 0)
+        for bad in ('0', '25', '1.234', 'x'):
+            with self.subTest(expires_hours=bad):
+                invalid = subprocess.run(['sh', str(script), '--server-url', url, '--path', str(source),
+                                          '--expires-hours', bad], env=env, capture_output=True, text=True, timeout=30)
+                self.assertIn('--expires-hours must be', invalid.stderr)
+
+    @unittest.skipUnless(all(shutil.which(t) for t in ('sh', 'curl', 'jq', 'base64')), 'Shell client dependencies are not installed')
+    def test_posix_shell_download_password_from_stdin(self):
+        source = Path(self.temp.name) / 'protected.bin'
+        source.write_bytes(os.urandom(300))
+        process, _ = self.shell_upload(source, secrets.token_hex(16), extra=['--ask-password'],
+                                       stdin='pä ss:word\n', password='pä ss:word')
+        self.assertNotIn('pä ss', process.stderr + process.stdout)
 
     @unittest.skipUnless(all(shutil.which(t) for t in ('sh', 'curl', 'jq', 'base64')), 'Shell client dependencies are not installed')
     def test_posix_shell_retries_server_error_and_lost_ack(self):
@@ -289,7 +429,7 @@ exec "$REAL_CURL" "$@"
         self.assertNotIn('/receive?', process.stderr)
 
     @unittest.skipUnless(shutil.which('pwsh'), 'PowerShell is not installed')
-    def test_powershell_client_and_resume(self):
+    def test_powershell_client_resume_and_password(self):
         data = os.urandom(5007)
         source = Path(self.temp.name) / "résumé 'file'.bin"
         source.write_bytes(data)
@@ -297,12 +437,15 @@ exec "$REAL_CURL" "$@"
         script = Path(__file__).resolve().parents[1] / 'Upload-File.ps1'
         transfer_id = secrets.token_hex(16)
         url = 'http://%s:%s' % self.server.server_address
+        password = "pä'ss"
         def ps_quote(value):
             return "'" + str(value).replace("'", "''") + "'"
         command = ('& ' + ps_quote(script) + ' -ServerUrl ' + ps_quote(url) + ' -Path ' + ps_quote(source)
-                   + ' -TransferId ' + ps_quote(transfer_id) + ' | ConvertTo-Json | Set-Content -LiteralPath ' + ps_quote(output))
+                   + ' -TransferId ' + ps_quote(transfer_id) + ' -ExpiresHours 1.5'
+                   + ' -DownloadPassword (ConvertTo-SecureString ' + ps_quote(password) + ' -AsPlainText -Force)'
+                   + ' | ConvertTo-Json | Set-Content -LiteralPath ' + ps_quote(output))
         # Pre-upload one chunk to exercise resume, then rerun the fully completed transfer.
-        transfer, _ = self.start(data, name=source.name, transfer_id=transfer_id)
+        transfer, _ = self.start(data, name=source.name, transfer_id=transfer_id, ttl_hours='1.5', password=password)
         self.request('/receive', self.chunk(transfer, data, 2))
         for _ in range(2):
             process = subprocess.run(['pwsh', '-NoProfile', '-NonInteractive', '-Command',
@@ -310,7 +453,9 @@ exec "$REAL_CURL" "$@"
             self.assertEqual(process.returncode, 0, process.stderr)
             result = json.loads(output.read_text(encoding='utf-8-sig'))
             self.assertEqual(result['SHA256'], hashlib.sha256(data).hexdigest())
-            self.assertEqual(self.request(urlsplit_path(result['DownloadUrl']))[1], data)
+            self.assertTrue(result['PasswordProtected'])
+            self.assertEqual(self.request(urlsplit_path(result['DownloadUrl']))[0], 401)
+            self.assertEqual(self.request(urlsplit_path(result['DownloadUrl']), headers=basic(password))[1], data)
 
 
 def urlsplit_path(url):

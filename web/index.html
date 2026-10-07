@@ -20,6 +20,9 @@
       </div>
       <label for="file-path">File path on your computer</label>
       <input id="file-path" type="text" placeholder="C:\Users\you\Downloads\report.zip" autocomplete="off" spellcheck="false">
+      <label for="expires-hours">Link disappears after (hours, 0.1–24)</label>
+      <input id="expires-hours" type="number" min="0.1" max="24" step="0.1" value="1" inputmode="decimal">
+      <label class="check"><input id="ask-password" type="checkbox"> Require a download password (the script asks for it; it never appears in the command)</label>
       <div class="command-top"><label for="command">PowerShell — run from the script's folder</label><button id="copy" type="button">Copy command</button></div>
       <textarea id="command" rows="4" readonly aria-label="PowerShell upload command"></textarea>
       <p class="hint">On Windows, run <code>Unblock-File .\Upload-File.ps1</code> after downloading it. Your PowerShell execution policy must permit scripts.</p>
@@ -35,15 +38,16 @@
       <p id="detail">Keep this page open while the script uploads. Interrupted uploads can resume with the same transfer ID.</p>
       <div id="result" hidden>
         <p id="filename" class="filename"></p>
-        <a id="download" class="button" href="#" download>↓ Download verified file</a>
+        <a id="download" class="button" href="#">↓ Download verified file</a>
         <p id="expires"></p>
+        <p id="password-note" hidden>Password protected: the browser asks for the download password (any username).</p>
         <label for="download-link">Shareable download link</label>
         <input id="download-link" readonly aria-label="Shareable download link">
         <button id="copy-link" type="button">Copy link</button>
         <details><summary>SHA-256 checksum</summary><code id="checksum"></code></details>
       </div>
     </section>
-    <footer><p id="limits">1 KiB chunks · SHA-256 verified · Downloads expire automatically</p><p>Anyone with the download link can access the file. GET URLs may appear in network logs; use a service you trust.</p></footer>
+    <footer><p id="limits">1 KiB chunks · SHA-256 verified · Downloads expire automatically</p><p>Anyone with the download link (and its password, if set) can access the file. When a link expires, the file is deleted. The service keeps a record of each upload (IP address, time, file name, size, checksum) and each visit to a download link (IP address, time, browser, result). GET URLs may appear in network logs; use a service you trust.</p></footer>
   </main>
 </body>
 </html>

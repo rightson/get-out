@@ -6,16 +6,18 @@ export LC_ALL
 
 usage() {
     cat <<'EOF'
-Usage: sh Upload-File.sh --server-url URL --path FILE [options]
+Usage: sh Upload-File.sh --server-url URL --path FILE --expires-hours H [options]
   --server-url URL   HTTPS service URL (HTTP allowed only on loopback)
   --path FILE        File to upload
+  --expires-hours H  Download link lifetime after upload, 0.1 to 24 hours
+  --ask-password     Require a download password (read from the terminal, or the first line of stdin)
   --transfer-id ID   32 lowercase hex characters; reuse to resume the same file
   --max-attempts N   Attempts per request, from 1 to 10 (default: 5)
   --open-result     Open the result page using xdg-open or macOS open
   --help            Show this help
 
 Example:
-  sh Upload-File.sh --server-url https://upload.example.com --path './report.zip' --open-result
+  sh Upload-File.sh --server-url https://upload.example.com --path './report.zip' --expires-hours 1 --open-result
 EOF
 }
 
@@ -24,24 +26,31 @@ server_url=
 file_path=
 transfer_id=
 max_attempts=5
+expires_hours=
+ask_password=0
 open_result=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --server-url|--path|--transfer-id|--max-attempts)
+        --server-url|--path|--transfer-id|--max-attempts|--expires-hours)
             [ "$#" -ge 2 ] || die "Missing value for $1"
             case "$1" in
                 --server-url) server_url=$2 ;;
                 --path) file_path=$2 ;;
                 --transfer-id) transfer_id=$2 ;;
                 --max-attempts) max_attempts=$2 ;;
+                --expires-hours) expires_hours=$2 ;;
             esac
             shift 2 ;;
         --open-result) open_result=1; shift ;;
+        --ask-password) ask_password=1; shift ;;
         --help|-h) usage; exit 0 ;;
         *) die "Unknown option: $1" ;;
     esac
 done
-[ -n "$server_url" ] && [ -n "$file_path" ] || { usage >&2; exit 1; }
+[ -n "$server_url" ] && [ -n "$file_path" ] && [ -n "$expires_hours" ] || { usage >&2; exit 1; }
+# Same format and range as the server: up to two decimals, 0.1 to 24.
+printf '%s\n' "$expires_hours" | awk '/^(0|[1-9][0-9]?)(\.[0-9][0-9]?)?$/ && $1 >= 0.1 && $1 <= 24 { ok = 1 } END { exit !ok }' ||
+    die '--expires-hours must be from 0.1 to 24.'
 case "$max_attempts" in 1|2|3|4|5|6|7|8|9|10) ;; *) die '--max-attempts must be from 1 to 10.' ;; esac
 for tool in curl jq base64 dd od tr awk wc mkdir rm; do
     command -v "$tool" >/dev/null 2>&1 || die "Required command is missing: $tool"
@@ -76,7 +85,8 @@ case "$transfer_id" in ''|*[!a-f0-9]*) die 'Transfer ID must be 32 lowercase hex
 umask 077
 work_dir=${TMPDIR:-/tmp}/lets-escape-$transfer_id-$$
 mkdir "$work_dir" || die 'Could not create a private temporary directory.'
-trap 'rm -rf "$work_dir"' 0
+# Restore terminal echo if interrupted at the password prompt.
+trap 'rm -rf "$work_dir"; if [ "$ask_password" -eq 1 ] && [ -t 0 ]; then stty echo; fi' 0
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
@@ -95,6 +105,28 @@ fi
 case "$digest" in ''|*[!a-f0-9]*) die 'Could not calculate SHA-256.' ;; esac
 [ "${#digest}" -eq 64 ] || die 'Could not calculate SHA-256.'
 size=$(wc -c < "$file_path" | tr -d ' ')
+start_auth=
+if [ "$ask_password" -eq 1 ]; then
+    if [ -t 0 ]; then
+        printf 'Download password: ' >&2
+        stty -echo
+        IFS= read -r password || password=
+        stty echo
+        printf '\nConfirm password: ' >&2
+        stty -echo
+        IFS= read -r confirm || confirm=
+        stty echo
+        printf '\n' >&2
+        [ "$password" = "$confirm" ] || die 'Passwords do not match.'
+    else
+        IFS= read -r password || [ -n "$password" ] || die 'No password on stdin.'
+    fi
+    [ -n "$password" ] || die 'Download password must not be empty.'
+    # Keep the password out of argv: curl reads the header from a private file.
+    printf 'Authorization: Basic %s\n' "$(printf ':%s' "$password" | base64 | tr -d '\n')" > "$work_dir/auth"
+    start_auth="@$work_dir/auth"
+    unset password confirm
+fi
 name=${file_path##*/}
 printf 'Transfer ID: %s\nKeep this ID to resume an interrupted upload of the same file.\n' "$transfer_id" >&2
 
@@ -129,8 +161,13 @@ get() (
     done
 )
 
-get /start --data-urlencode "id=$transfer_id" --data-urlencode "name=$name" \
-    --data-urlencode "size=$size" --data-urlencode "sha256=$digest"
+if [ -n "$start_auth" ]; then
+    get /start --header "$start_auth" --data-urlencode "id=$transfer_id" --data-urlencode "name=$name" \
+        --data-urlencode "size=$size" --data-urlencode "sha256=$digest" --data-urlencode "ttl_hours=$expires_hours"
+else
+    get /start --data-urlencode "id=$transfer_id" --data-urlencode "name=$name" \
+        --data-urlencode "size=$size" --data-urlencode "sha256=$digest" --data-urlencode "ttl_hours=$expires_hours"
+fi
 chunk_size=$(jq -er '.chunk_size | select(type == "number" and . >= 64 and . <= 1024 and floor == .)' "$work_dir/response.json")
 total=$(((size + chunk_size - 1) / chunk_size))
 if [ "$total" -eq 0 ]; then total=1; fi
@@ -179,7 +216,7 @@ printf '\nUploaded and verified.\n' >&2
 result_url=$server_url/#id=$transfer_id
 # Print machine-readable output equivalent to the PowerShell result object.
 jq --arg base "$server_url" --arg page "$result_url" \
-    '{TransferId: .id, DownloadUrl: ($base + .download_url), ResultPage: $page, ExpiresUtc: (.expires | floor | todateiso8601), SHA256: .sha256}' \
+    '{TransferId: .id, DownloadUrl: ($base + .download_url), ResultPage: $page, ExpiresUtc: (.expires | floor | todateiso8601), PasswordProtected: .password_protected, SHA256: .sha256}' \
     "$work_dir/response.json"
 if [ "$open_result" -eq 1 ]; then
     if command -v xdg-open >/dev/null 2>&1; then
