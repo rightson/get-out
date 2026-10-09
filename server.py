@@ -61,6 +61,11 @@ def password_matches(stored, password):
     return hmac.compare_digest(hash_password(password, bytes.fromhex(stored.split("$")[0])), stored)
 
 
+# A throwaway hash so an unknown email still costs one scrypt at login: a missing account must not
+# answer faster than a wrong password, or the timing gap would enumerate registered addresses.
+DECOY_HASH = hash_password(secrets.token_hex(16))
+
+
 class Store:
     def __init__(self, directory, *, chunk_size=1024, max_file=10 * 1024**2,
                  max_storage=1024**3, max_transfers=100, clock=time.time):
@@ -90,7 +95,7 @@ class Store:
                 -- Audit records outlive transfers: cleanup never deletes them.
                 CREATE TABLE IF NOT EXISTS upload_log (
                   token TEXT PRIMARY KEY, transfer_id TEXT NOT NULL, ip TEXT NOT NULL,
-                  name TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL,
+                  uploader TEXT, name TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL,
                   ttl REAL NOT NULL, password INTEGER NOT NULL, started REAL NOT NULL,
                   state TEXT NOT NULL, completed REAL, expires REAL, deleted REAL
                 );
@@ -124,6 +129,9 @@ class Store:
                 conn.execute("ALTER TABLE transfers ADD COLUMN ttl REAL NOT NULL DEFAULT 3600")
             if "password" not in columns:
                 conn.execute("ALTER TABLE transfers ADD COLUMN password TEXT")
+            # Databases created before uploads were attributed to signed-in accounts.
+            if "uploader" not in {r[1] for r in conn.execute("PRAGMA table_info(upload_log)")}:
+                conn.execute("ALTER TABLE upload_log ADD COLUMN uploader TEXT")
         self.cleanup()
 
     @contextmanager
@@ -169,7 +177,7 @@ class Store:
             result["download_url"] = "/download/" + row["token"]
         return result
 
-    def start(self, params, ip, password=None):
+    def start(self, params, ip, password=None, uploader=None):
         transfer_id = self.transfer_id(params["id"])
         name, digest = params["name"], params["sha256"]
         size = self.integer(params["size"])
@@ -203,9 +211,9 @@ class Store:
                          (transfer_id, name, size, digest, max(1, math.ceil(size / self.chunk_size)),
                           self.chunk_size, now, now + UPLOAD_WINDOW, token, ttl,
                           None if password is None else hash_password(password)))
-            conn.execute("INSERT INTO upload_log(token,transfer_id,ip,name,size,sha256,ttl,password,started,state) "
-                         "VALUES(?,?,?,?,?,?,?,?,?,'uploading')",
-                         (token, transfer_id, ip, name, size, digest, ttl, password is not None, now))
+            conn.execute("INSERT INTO upload_log(token,transfer_id,ip,uploader,name,size,sha256,ttl,password,started,state) "
+                         "VALUES(?,?,?,?,?,?,?,?,?,?,'uploading')",
+                         (token, transfer_id, ip, uploader, name, size, digest, ttl, password is not None, now))
             return self.result(self.get(conn, transfer_id))
 
     def receive(self, params):
@@ -315,6 +323,9 @@ class Store:
         if not MIN_PASSWORD <= len(password) <= MAX_PASSWORD:
             raise APIError(400, f"Password must be {MIN_PASSWORD} to {MAX_PASSWORD} characters")
         token = secrets.token_hex(32)
+        # scrypt is deliberately slow; compute it before taking the write lock so a flood of
+        # registrations cannot serialise every other writer behind it.
+        password_hash = hash_password(password)
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             # The check-and-insert runs in one transaction so two simultaneous first sign-ups
@@ -323,7 +334,7 @@ class Store:
             try:
                 conn.execute(
                     "INSERT INTO users(email,password,api_token,is_active,is_admin,created) VALUES(?,?,?,?,?,?)",
-                    (email, hash_password(password), token, int(first), int(first), self.clock()))
+                    (email, password_hash, token, int(first), int(first), self.clock()))
             except sqlite3.IntegrityError:
                 raise APIError(409, "An account with this email already exists") from None
             user = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
@@ -337,7 +348,10 @@ class Store:
             return None, "invalid"
         with self.connect() as conn:
             user = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
-        if user is None or not password_matches(user["password"], password):
+        # Always run exactly one scrypt, against a decoy when the account is unknown, so timing does
+        # not reveal whether the email is registered.
+        matches = password_matches(user["password"] if user is not None else DECOY_HASH, password)
+        if user is None or not matches:
             return None, "invalid"
         return (user, "ok") if user["is_active"] else (user, "inactive")
 
@@ -464,15 +478,15 @@ def audit_report(directory, out=sys.stdout):
     utc = lambda t: "-" if t is None else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
     try:
         print("UPLOADS", file=out)
-        print("started_utc\tip\ttransfer_id\tname\tsize\tsha256\tpassword\tttl_hours\tstate"
+        print("started_utc\tip\tuploader\ttransfer_id\tname\tsize\tsha256\tpassword\tttl_hours\tstate"
               "\tcompleted_utc\texpires_utc\tdeleted_utc\tclicks\tdownloads", file=out)
         for r in conn.execute("""
-                SELECT u.started, u.ip, u.transfer_id, u.name, u.size, u.sha256, u.password, u.ttl, u.state,
-                       u.completed, u.expires, u.deleted, COUNT(a.token), COALESCE(SUM(a.result='downloaded'),0)
+                SELECT u.started, u.ip, u.uploader, u.transfer_id, u.name, u.size, u.sha256, u.password, u.ttl,
+                       u.state, u.completed, u.expires, u.deleted, COUNT(a.token), COALESCE(SUM(a.result='downloaded'),0)
                 FROM upload_log u LEFT JOIN access_log a ON a.token=u.token
                 GROUP BY u.token ORDER BY u.started"""):
-            print("\t".join(map(str, (utc(r[0]), r[1], r[2], r[3], r[4], r[5], "yes" if r[6] else "no",
-                                      round(r[7] / 3600, 2), r[8], utc(r[9]), utc(r[10]), utc(r[11]), r[12], r[13]))),
+            print("\t".join(map(str, (utc(r[0]), r[1], r[2] or "-", r[3], r[4], r[5], r[6], "yes" if r[7] else "no",
+                                      round(r[8] / 3600, 2), r[9], utc(r[10]), utc(r[11]), utc(r[12]), r[13], r[14]))),
                   file=out)
         print("\nACCESSES", file=out)
         print("at_utc\tip\tresult\ttransfer_id\tname\tuser_agent", file=out)
@@ -604,10 +618,10 @@ class Handler(BaseHTTPRequestHandler):
         return morsel.value if morsel else None
 
     def current_user(self):
-        # One lookup per request; browsers send a session cookie, CLI clients send their api_token.
-        if not hasattr(self, "_user"):
-            self._user = self.server.store.user_for_cookie(self.session_token())
-        return self._user
+        # Resolve per request. A handler instance is reused for every request on a keep-alive
+        # connection, so caching the result would let a logged-out, expired, or deactivated session
+        # keep access until the socket closed. Each route calls this at most once per request.
+        return self.server.store.user_for_cookie(self.session_token())
 
     def require_user(self):
         user = self.current_user()
@@ -695,7 +709,7 @@ class Handler(BaseHTTPRequestHandler):
             url = urlsplit(self.path)
             store = self.server.store
             if url.path in {"/start", "/receive", "/status"}:
-                self.require_user()  # Uploading is for signed-in, activated accounts only.
+                user = self.require_user()  # Uploading is for signed-in, activated accounts only.
                 required = {"/start": {"id", "name", "size", "sha256", "ttl_hours"},
                             "/receive": {"id", "seq", "total", "data"}, "/status": {"id"}}[url.path]
                 query = parse_qs(url.query, keep_blank_values=True, max_num_fields=8, errors="strict")
@@ -711,7 +725,7 @@ class Handler(BaseHTTPRequestHandler):
                 # The optional download password travels in a Basic Authorization header, never the URL.
                 try:
                     result = store.status(params["id"]) if url.path == "/status" else (
-                        store.start(params, ip, self.basic_password()) if url.path == "/start"
+                        store.start(params, ip, self.basic_password(), user["email"]) if url.path == "/start"
                         else store.receive(params))
                 except APIError as error:
                     if error.status == 404 and url.path != "/start":

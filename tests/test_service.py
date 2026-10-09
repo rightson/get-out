@@ -349,8 +349,9 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(conn.execute('SELECT COUNT(*) FROM transfers').fetchone()[0], 0)
             upload = conn.execute('SELECT * FROM upload_log').fetchone()
             accesses = [tuple(r) for r in conn.execute('SELECT ip, result, user_agent FROM access_log ORDER BY rowid')]
-        self.assertEqual((upload['transfer_id'], upload['ip'], upload['name'], upload['size'], upload['state'], upload['password']),
-                         (transfer['id'], '127.0.0.1', 'example.bin', len(data), 'complete', 1))
+        self.assertEqual((upload['transfer_id'], upload['ip'], upload['uploader'], upload['name'], upload['size'],
+                          upload['state'], upload['password']),
+                         (transfer['id'], '127.0.0.1', 'admin@example.com', 'example.bin', len(data), 'complete', 1))
         self.assertEqual(upload['deleted'], self.now)
         self.assertEqual(accesses, [
             ('203.0.113.7', 'password_required', 'probe'), ('203.0.113.7', 'wrong_password', ''),
@@ -358,7 +359,8 @@ class ServiceTests(unittest.TestCase):
             ('127.0.0.1', 'expired', ''), ('127.0.0.1', 'not_found', '')])
         report = io.StringIO()
         audit_report(self.temp.name, report)
-        line = next(l for l in report.getvalue().splitlines() if l.split('\t')[2:3] == [transfer['id']])
+        line = next(l for l in report.getvalue().splitlines() if l.split('\t')[3:4] == [transfer['id']])
+        self.assertEqual(line.split('\t')[2], 'admin@example.com')  # uploader column
         self.assertTrue(line.endswith('\t6\t2'), line)
         self.assertIn('203.0.113.7\twrong_password', report.getvalue())
 
@@ -480,6 +482,39 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.request('/me', headers={'Cookie': cookie}, auth=False)[0], 200)
         self.store.set_user_active(bob['id'], False)
         self.assertEqual(self.request('/me', headers={'Cookie': cookie}, auth=False)[0], 401)
+
+    def test_auth_resolved_per_request_on_a_keepalive_connection(self):
+        # One handler instance serves a whole keep-alive connection, so auth must be re-checked on
+        # every request: a mid-connection login must take effect and a logout must revoke access.
+        origin = 'http://%s:%d' % self.server.server_address
+        conn = http.client.HTTPConnection(*self.server.server_address, timeout=5)
+
+        def call(method, path, cookie=None, body=None):
+            headers = {}
+            if cookie:
+                headers['Cookie'] = cookie
+            if body is not None:
+                body = urlencode(body)
+                headers['Content-Type'] = 'application/x-www-form-urlencoded'
+                headers['Origin'] = origin
+            conn.request(method, path, body=body, headers=headers)
+            response = conn.getresponse()
+            response.read()  # keep the connection reusable
+            return response.status, dict(response.getheaders())
+
+        try:
+            # Resolve an anonymous request first, so a per-connection cache would be poisoned to None.
+            self.assertEqual(call('GET', '/me')[0], 401)
+            status, headers = call('POST', '/login', body={'email': 'admin@example.com', 'password': 'hunter2hunter'})
+            self.assertEqual(status, 303)
+            cookie = headers['Set-Cookie'].split(';', 1)[0]
+            # Same connection, now with the fresh cookie: the login must be honored, not redirected.
+            self.assertEqual(call('GET', '/me', cookie=cookie)[0], 200)
+            # Logout must revoke access on the very next request on this same connection.
+            self.assertEqual(call('POST', '/logout', cookie=cookie)[0], 303)
+            self.assertEqual(call('GET', '/me', cookie=cookie)[0], 401)
+        finally:
+            conn.close()
 
     def test_csrf_cross_origin_post_is_blocked(self):
         status, _, _ = self.form('/login', {'email': 'admin@example.com', 'password': 'hunter2hunter'},

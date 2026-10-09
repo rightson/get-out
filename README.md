@@ -160,7 +160,7 @@ The storage budget reserves the declared file size when a transfer starts. Leave
 
 The database keeps two tables that cleanup never deletes, so the history remains after the file is gone:
 
-- `upload_log`: uploader IP, start/completion/expiry/deletion times, filename, size, SHA-256, chosen lifetime, whether a password was set, and final state (`complete`, `failed`, or `abandoned`).
+- `upload_log`: the uploader's account and IP, start/completion/expiry/deletion times, filename, size, SHA-256, chosen lifetime, whether a password was set, and final state (`complete`, `failed`, or `abandoned`).
 - `access_log`: every request to an issued download link, with IP, time, User-Agent, and result: `downloaded`, `interrupted`, `password_required`, `wrong_password`, `expired`, or `not_found` (after deletion). Requests for tokens the service never issued are not recorded.
 
 `python3 server.py audit` (or `docker compose exec upload python server.py audit`) opens the database read-only and prints tab-separated uploads with click and completed-download counts, followed by every access. Records are kept indefinitely; IP addresses can be personal data, so set a retention policy that fits your jurisdiction. Behind a reverse proxy, every request comes from the proxy's address: set `--trust-proxy` (`TRUST_PROXY=1`) and have the proxy set `X-Real-IP`, as `deploy/nginx.conf` does. Never enable it when clients can reach the service directly, because they could forge the header.
