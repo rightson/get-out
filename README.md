@@ -1,6 +1,16 @@
-# Let's Escape
+# get-out
 
-A file upload service that carries **1 KiB raw chunks in HTTP GET query parameters**. The upload page sends files straight from the browser, shows progress, and gives a shareable download link; PowerShell and POSIX shell clients are the fallback when a browser can't upload. The server verifies the whole-file SHA-256 before making a download available. The uploader chooses when the link disappears (**0.1 to 24 hours after verification**) and can require a **download password**. At expiry the link stops working and the file is deleted. The server keeps an audit log of uploads and download-link visits (see [Audit log](#audit-log)).
+An **invite-only** file transfer service that moves files in tiny pieces — **1 KiB raw chunks carried in HTTP GET query parameters** — and reassembles them, cached chunk by chunk, on the server. The GET-only, acknowledged, resumable protocol is the "ant-moving" idea: data crosses networks that only permit GET, one small, retriable request at a time. The upload page sends files straight from the browser, shows progress, and gives a shareable download link; PowerShell and POSIX shell clients are the fallback when a browser can't upload. The server verifies the whole-file SHA-256 before making a download available. The uploader chooses when the link disappears (**0.1 to 24 hours after verification**) and can require a **download password**. At expiry the link stops working and the file is deleted. The server keeps an audit log of uploads and download-link visits (see [Audit log](#audit-log)).
+
+Like [pull-in](https://github.com/rightson/pull-in), **accounts are invite-only and you must sign in to upload.** Downloads stay public: a download link is a bearer capability you can share with anyone, and they need no account to fetch the file.
+
+## Accounts and sign-in
+
+- **The first person to register becomes the administrator**, is activated immediately, and is signed in. There is no separate admin-creation step.
+- **Everyone who registers after that stays inactive** until the administrator activates them at `/users`. An inactive account cannot sign in or upload, and is told it is awaiting activation.
+- Passwords are 8 to 128 characters, stored only as salted scrypt hashes. Sessions are HttpOnly, `SameSite=Strict` cookies; only a SHA-256 of each session cookie is kept server-side.
+- The administrator manages accounts at `/users`: activate or deactivate anyone but themselves. Deactivating an account also revokes its open sessions.
+- Accounts, sessions, and the audit log live in the same private SQLite database as the transfers (`DATA_DIR`). Keep that directory on a persistent volume so accounts survive restarts.
 
 ## Run locally
 
@@ -13,17 +23,31 @@ python3 server.py --watch      # development: restart when server.py changes
 python3 server.py audit        # print upload and download history
 ```
 
-`--port`, `--max-file-mb` (default 10 MiB), and `--trust-proxy` override the `PORT`, `MAX_FILE_MB`, and `TRUST_PROXY` environment variables. `--watch` runs the server in a child process and restarts it within about a second of a change to `server.py`; the web page and client scripts are read on each request, so they never need a restart.
+`--port`, `--max-file-mb` (default 10 MiB), `--trust-proxy`, and `--secure-cookies` override the `PORT`, `MAX_FILE_MB`, `TRUST_PROXY`, and `COOKIE_SECURE` environment variables. `--watch` runs the server in a child process and restarts it within about a second of a change to `server.py`; the web page and client scripts are read on each request, so they never need a restart.
 
-Open `http://localhost:8080`, choose a file, set when the link disappears and an optional download password, and select **Upload**. The browser reads the file with the File API, computes its SHA-256 with Web Crypto, and sends chunks with the same GET protocol as the scripts (four requests in flight, with the scripts' retry policy). No local path is needed: browsers never reveal one. Web Crypto requires HTTPS (or `localhost`), and the whole file is read into memory, which is fine within the file-size limit.
+Open `http://localhost:8080`. The first visit sends you to **Create an account**; that first account becomes the administrator and is signed in. Then choose a file, set when the link disappears and an optional download password, and select **Upload**. The browser reads the file with the File API, computes its SHA-256 with Web Crypto, and sends chunks with the same GET protocol as the scripts (four requests in flight, with the scripts' retry policy). No local path is needed: browsers never reveal one. Web Crypto requires HTTPS (or `localhost`), and the whole file is read into memory, which is fine within the file-size limit.
 
 If the browser can't upload (the network blocks it, retries run out, or the page isn't served over HTTPS), the page opens **Browser can't upload? Use a script instead** and explains why. The generated commands use the same transfer ID, expiry, and password setting, so a script resumes whatever the browser already sent. Rejections a script can't fix, such as an oversized file, don't open it.
+
+## Script access token
+
+Because uploading requires a signed-in account, the scripts need the same credential the browser carries. The signed-in upload page shows a **script access token** (and a **Regenerate** button that invalidates the old one). Set it before running either client — it travels as your session cookie and never appears on the command line:
+
+```powershell
+$Env:GETOUT_TOKEN = '…'   # PowerShell
+```
+```sh
+export GETOUT_TOKEN='…'    # shell
+```
+
+Both clients also accept `-Token`/`--token`, but the environment variable keeps the token out of your shell history. If the token is missing or has been regenerated, the client stops with a clear message and the server answers `401`. Downloads never need the token.
 
 ## PowerShell client
 
 Download `Upload-File.ps1` from the page, enter the file's local path, and copy the generated command. The page tracks that transfer while PowerShell sends the chunks. The script can also run directly in Windows PowerShell 5.1 or PowerShell 7:
 
 ```powershell
+$Env:GETOUT_TOKEN = '…'
 Unblock-File .\Upload-File.ps1
 .\Upload-File.ps1 -ServerUrl http://localhost:8080 -Path 'C:\files\report.zip' -ExpiresHours 1 -OpenResult
 ```
@@ -45,6 +69,7 @@ Both clients request missing sequences, retry network failures and HTTP 408/429/
 The upload page's script section provides `Upload-File.sh` beside the PowerShell download, with a generated command for each. The shell script uses POSIX `sh` syntax and runs under `sh`, `dash`, or Bash on Linux and macOS; Bash-specific features are not required. Dependencies: `curl`, `jq`, `base64`, standard shell utilities, and one of `sha256sum`, `shasum`, or `openssl`. Run without `--transfer-id`, it uses `/dev/urandom` to generate a 32-character hex ID. Install `jq` if needed (for example, `sudo apt install jq` or `brew install jq`).
 
 ```sh
+export GETOUT_TOKEN='…'
 sh ./Upload-File.sh --server-url http://localhost:8080 --path './report.zip' --expires-hours 1 --open-result
 ```
 
@@ -62,6 +87,7 @@ sh ./Upload-File.sh --server-url https://upload.example.com --path './report.zip
 | `-ServerUrl` | `--server-url` |
 | `-Path` | `--path` |
 | `-ExpiresHours` | `--expires-hours` |
+| `-Token` (or `$Env:GETOUT_TOKEN`) | `--token` (or `$GETOUT_TOKEN`) |
 | `-DownloadPassword` | `--ask-password` |
 | `-TransferId` | `--transfer-id` |
 | `-MaxAttempts` | `--max-attempts` |
@@ -70,6 +96,8 @@ sh ./Upload-File.sh --server-url https://upload.example.com --path './report.zip
 The shell client prints progress to stderr and the result object as JSON to stdout, so you can save it with `> result.json`. `--open-result` uses `xdg-open` on Linux or `open` on macOS; without a browser opener it prints the result page URL for manual use. It accepts HTTPS for remote servers and HTTP only for loopback, does not follow redirects, ignores `.curlrc`, and removes its private temporary files on exit. It streams one chunk at a time; keep the source file unchanged during upload. Use `--help` for all options.
 
 ## Protocol
+
+`/start`, `/receive`, and `/status` require a signed-in, activated account. The browser sends its session cookie automatically; the scripts send their token in the same `getout_session` cookie (from `GETOUT_TOKEN`). An unauthenticated or deactivated caller gets HTTP 401. `/download/<token>`, `/health`, `/config`, and the static assets stay public.
 
 All fields are URL encoded. A transfer ID is either four lowercase words joined by hyphens, drawn uniformly from `web/words.txt` ([EFF short wordlist 1](https://www.eff.org/dice), CC BY 3.0 US, without its one hyphenated word: 1,295 words of 3 to 5 letters, about 41 bits), or 32 lowercase hexadecimal characters (128 bits; clients run without an ID generate these). The upload page generates word IDs; the server rejects words that are not in the list, so a typo fails loudly instead of silently starting a different transfer. Treat IDs as bearer capabilities: anyone holding one can query transfer progress and obtain the eventual download URL.
 
@@ -123,7 +151,8 @@ An incomplete upload expires 24 hours after creation, regardless of the chosen l
 | `MAX_STORAGE_BYTES` | `1073741824` | Sum of reserved file sizes, 1 GiB |
 | `MAX_TRANSFERS` | `100` | Maximum retained transfers, including incomplete/failed ones |
 | `ID_MISS_LIMIT` | `120` | Per-IP lookups of unknown transfer IDs allowed per minute |
-| `TRUST_PROXY` | unset | `1` logs the client IP from the proxy's `X-Real-IP` header (`--trust-proxy`) |
+| `TRUST_PROXY` | unset | `1` trusts the proxy's `X-Real-IP` (client IP) and `X-Forwarded-Proto` (for `Secure` cookies) (`--trust-proxy`) |
+| `COOKIE_SECURE` | unset | `1` always marks the session cookie `Secure`, even without a trusted `X-Forwarded-Proto` (`--secure-cookies`) |
 
 The storage budget reserves the declared file size when a transfer starts. Leave additional disk capacity for SQLite overhead, WAL, and the temporary assembled file: this is a logical file budget, not a hard disk quota. Capacity exhaustion returns HTTP 503. The service limits itself to 32 request threads and sets connection timeouts. `/health` is a liveness check; `/config` exposes the chunk size, file-size limit, and allowed link lifetime (`min_ttl_hours`, `max_ttl_hours`).
 
@@ -148,7 +177,7 @@ One 1,024-byte chunk becomes 1,366 Base64URL characters (roughly 33% overhead). 
 
 All app responses carry `Cache-Control: no-store`, `Pragma: no-cache`, and `Referrer-Policy: no-referrer`. Configure any CDN to bypass caching for this service, and disable request/query capture in upstream access logs, tracing, and analytics. The Python handler does not log request URLs. The Nginx example suppresses error logging because those messages can include the original URL; use app diagnostics when investigating failures.
 
-This is an anonymous upload service: possession of the generated links (plus the download password, if one is set) grants access, and there are no accounts or encryption at rest. The upload page tells users that IP addresses and visits are logged. GET-based persistence conflicts with GET's intended read-only semantics, and URLs can appear in intermediary logs even over HTTPS. Use HTTPS and trusted intermediaries. For a private deployment, add authentication at the reverse proxy; public deployments should also apply infrastructure quotas. The included client never redirects payload-bearing requests and never prints payload URLs in transport errors.
+Uploading is invite-only: only a signed-in, activated account can create or continue a transfer. A session cookie is `SameSite=Strict`, HttpOnly, and `Secure` behind TLS; the server stores only its SHA-256 and verifies the request's `Origin` on every state-changing POST, so cross-site requests cannot act on a signed-in session. **Downloads, by design, stay public**: possession of a download link (plus the download password, if one is set) grants access with no account, and files are not encrypted at rest. The upload page tells users that the account, IP addresses, and visits are logged. GET-based persistence conflicts with GET's intended read-only semantics, and URLs can appear in intermediary logs even over HTTPS, so always run behind HTTPS with trusted intermediaries; public deployments should also apply infrastructure quotas. The included client never redirects payload-bearing requests and never prints payload URLs or the token in transport errors.
 
 ## Test
 
@@ -157,4 +186,4 @@ python3 -m unittest discover -s tests -v
 node --check web/app.js
 ```
 
-The tests use a live HTTP server and cover out-of-order chunks, duplicate/conflicting retries, concurrent requests, resume after restart, zero-byte files, SHA-256 failure, URL/input limits, HEAD behavior, uploader-chosen expiry and cleanup, download passwords, the audit log and proxy IP handling, `--watch` restarts, capacity limits, and response headers. With Node.js installed, they load `web/app.js` against a minimal DOM stub (`tests/browser_upload.mjs`) and run real browser uploads with and without a password, plus the oversized-file and unreachable-server fallbacks. With `sh`, `curl`, and `jq` installed, they also exercise the actual shell client, including binary/empty files, partial resume, completed retries, lost acknowledgments, and a password read from stdin. With `pwsh` installed, they run the PowerShell uploader with a download password, resume a partially uploaded binary file, rerun a completed upload, and compare downloaded bytes. CI requires the client dependencies and builds the container too.
+The tests use a live HTTP server and cover out-of-order chunks, duplicate/conflicting retries, concurrent requests, resume after restart, zero-byte files, SHA-256 failure, URL/input limits, HEAD behavior, uploader-chosen expiry and cleanup, download passwords, the audit log and proxy IP handling, `--watch` restarts, capacity limits, and response headers. They also cover the invite-only accounts: the first user becoming admin, later users staying inactive until activated, session login and logout, uploads requiring authentication while downloads stay public, the admin user page and its guards, the CSRF Origin check, session-cookie attributes, deactivation revoking sessions, token regeneration, and HTML escaping. With Node.js installed, they load `web/app.js` against a minimal DOM stub (`tests/browser_upload.mjs`) and run real browser uploads with and without a password, plus the oversized-file and unreachable-server fallbacks. With `sh`, `curl`, and `jq` installed, they also exercise the actual shell client, including binary/empty files, partial resume, completed retries, lost acknowledgments, and a password read from stdin. With `pwsh` installed, they run the PowerShell uploader with a download password, resume a partially uploaded binary file, rerun a completed upload, and compare downloaded bytes. CI requires the client dependencies and builds the container too.

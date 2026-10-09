@@ -20,11 +20,18 @@ const element = (id) => {
 };
 element('expires-hours').value = '0.5';
 const intervals = [];
+// A real browser attaches the session cookie automatically; here we inject the account's token.
+const token = process.env.GETOUT_TOKEN;
+const authFetch = (url, opts = {}) => {
+  const headers = new Headers(opts.headers || {});
+  if (token) headers.set('Cookie', 'getout_session=' + token);
+  return globalThis.fetch(url, { ...opts, headers });
+};
 const context = {
   document: { getElementById: element },
-  window: { location: { href: base + '/', hash: '' }, addEventListener() {} },
+  window: { location: { href: base + '/', hash: '', assign() {} }, addEventListener() {} },
   history: { replaceState(_state, _title, url) { context.window.location.hash = url; } },
-  crypto: globalThis.crypto, fetch: globalThis.fetch, btoa: globalThis.btoa, TextEncoder, URL, URLSearchParams,
+  crypto: globalThis.crypto, fetch: authFetch, btoa: globalThis.btoa, TextEncoder, URL, URLSearchParams, Headers,
   Intl, Date, Math, Number, Promise, Uint8Array, Error, Array, String, console, setTimeout,
   setInterval: (fn, ms) => { intervals.push(setInterval(fn, ms)); },
   navigator: {},

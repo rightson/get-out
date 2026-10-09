@@ -17,7 +17,7 @@ import time
 import unittest
 from urllib.parse import urlencode
 
-from server import MAX_TTL, MIN_TTL, UPLOAD_WINDOW, WORDS, Server, Store, audit_report
+from server import AWAITING, MAX_TTL, MIN_TTL, SESSION_COOKIE, UPLOAD_WINDOW, WORDS, Server, Store, audit_report
 
 HOUR = 60 * 60
 
@@ -31,6 +31,11 @@ class ServiceTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.now = 1700000000
         self.store = Store(self.temp.name, clock=lambda: self.now, max_file=8192, max_storage=16384)
+        # The first account is the active administrator; uploading needs a signed-in account. The
+        # api_token has no expiry, so it keeps authenticating even when a test moves the clock.
+        self.user, _ = self.store.create_user('admin@example.com', 'hunter2hunter')
+        self.api_token = self.user['api_token']
+        self.cookie = f'{SESSION_COOKIE}={self.api_token}'
         self.server = Server(('127.0.0.1', 0), self.store)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -41,12 +46,15 @@ class ServiceTests(unittest.TestCase):
         self.thread.join()
         self.temp.cleanup()
 
-    def request(self, path, params=None, method='GET', headers=None):
+    def request(self, path, params=None, method='GET', headers=None, auth=True):
         if params is not None:
             path += '?' + urlencode(params)
+        sent = dict(headers or {})
+        if auth and 'Cookie' not in sent:  # Authenticate upload requests by default.
+            sent['Cookie'] = self.cookie
         conn = http.client.HTTPConnection(*self.server.server_address, timeout=5)
         try:
-            conn.request(method, path, headers=headers or {})
+            conn.request(method, path, headers=sent)
             response = conn.getresponse()
             body = response.read()
             headers = dict(response.getheaders())
@@ -55,6 +63,32 @@ class ServiceTests(unittest.TestCase):
             return response.status, body, headers
         finally:
             conn.close()
+
+    def form(self, path, fields, headers=None):
+        body = urlencode(fields)
+        sent = {'Content-Type': 'application/x-www-form-urlencoded',
+                'Origin': 'http://%s:%d' % self.server.server_address, **(headers or {})}
+        conn = http.client.HTTPConnection(*self.server.server_address, timeout=5)
+        try:
+            conn.request('POST', path, body=body, headers=sent)
+            response = conn.getresponse()
+            data = response.read()
+            return response.status, data, dict(response.getheaders())
+        finally:
+            conn.close()
+
+    def register(self, email, password, password2=None, headers=None):
+        return self.form('/register', {'email': email, 'password': password,
+                                       'password2': password if password2 is None else password2}, headers)
+
+    def login(self, email, password, headers=None):
+        return self.form('/login', {'email': email, 'password': password}, headers)
+
+    def cookie_from(self, headers):
+        return headers['Set-Cookie'].split(';', 1)[0]  # getout_session=<token>
+
+    def user_named(self, email):
+        return next(u for u in self.store.list_users() if u['email'] == email)
 
     def start(self, data, name='example.bin', digest=None, transfer_id=None, ttl_hours='1', password=None):
         transfer_id = transfer_id or secrets.token_hex(16)
@@ -175,7 +209,7 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.request('/status?' + 'x' * 2048)[0], 414)
         self.assertEqual(self.request('/receive', chunk, method='HEAD')[0], 405)
         self.assertEqual(self.request('/status', {'id': transfer['id']})[1]['received'], 0)
-        self.assertEqual(self.request('/receive', chunk, method='POST')[0], 501)
+        self.assertEqual(self.request('/receive', chunk, method='POST')[0], 405)
         self.assertEqual(self.request('/start', {**params, 'name': '../file'})[0], 400)
         self.assertEqual(self.request('/start', {**params, 'size': 99999})[0], 413)
         self.assertEqual(self.request('/start', {**params, 'name': 'different'})[0], 409)
@@ -373,11 +407,137 @@ class ServiceTests(unittest.TestCase):
             process.terminate()
             process.wait(timeout=10)
 
+    def test_invite_only_registration_and_first_user_is_admin(self):
+        # setUp registered admin@ as the first account, so it is the active administrator.
+        users = self.store.list_users()
+        self.assertEqual(len(users), 1)
+        self.assertTrue(users[0]['is_admin'] and users[0]['is_active'])
+        # A later registration creates an inactive account and does not sign anyone in.
+        status, _, headers = self.register('bob@example.com', 'password123')
+        self.assertEqual((status, headers['Location']), (303, '/login?m=awaiting'))
+        self.assertNotIn('Set-Cookie', headers)
+        bob = self.user_named('bob@example.com')
+        self.assertFalse(bob['is_active'] or bob['is_admin'])
+        # An inactive account cannot sign in and is told it awaits activation.
+        status, body, headers = self.login('bob@example.com', 'password123')
+        self.assertEqual(status, 200)
+        self.assertIn(AWAITING.encode(), body)
+        self.assertNotIn('Set-Cookie', headers)
+
+    def test_login_session_enables_upload_and_logout_revokes_it(self):
+        status, _, headers = self.login('admin@example.com', 'hunter2hunter')
+        self.assertEqual((status, headers['Location']), (303, '/'))
+        cookie = self.cookie_from(headers)
+        for attribute in ('HttpOnly', 'SameSite=Strict', 'Path=/'):
+            self.assertIn(attribute, headers['Set-Cookie'])
+        self.assertNotIn('Secure', headers['Set-Cookie'])  # loopback/dev over http
+        data = b'hello via session cookie'
+        params = dict(id=secrets.token_hex(16), name='s.bin', size=len(data),
+                      sha256=hashlib.sha256(data).hexdigest(), ttl_hours='1')
+        self.assertEqual(self.request('/start', params, headers={'Cookie': cookie}, auth=False)[0], 200)
+        self.assertEqual(self.request('/me', headers={'Cookie': cookie}, auth=False)[1]['email'], 'admin@example.com')
+        self.assertEqual(self.form('/logout', {}, headers={'Cookie': cookie})[0], 303)
+        self.assertEqual(self.request('/me', headers={'Cookie': cookie}, auth=False)[0], 401)
+
+    def test_upload_requires_authentication_but_download_is_public(self):
+        params = dict(id=secrets.token_hex(16), name='x', size=1, sha256='0' * 64, ttl_hours='1')
+        self.assertEqual(self.request('/start', params, auth=False)[0], 401)
+        self.assertEqual(self.request('/status', {'id': 'a' * 32}, auth=False)[0], 401)
+        self.assertEqual(self.request('/', auth=False)[0], 303)  # anonymous visitors are sent to sign in
+        # A verified upload downloads with no account or cookie at all.
+        data = b'public download bytes'
+        result = self.upload(data)
+        self.assertEqual(self.request(result['download_url'], auth=False)[1], data)
+
+    def test_admin_activates_user_who_can_then_sign_in(self):
+        self.register('carol@example.com', 'password123')
+        carol = self.user_named('carol@example.com')
+        self.assertEqual(self.login('carol@example.com', 'password123')[0], 200)  # inactive: cannot sign in
+        status, _, _ = self.form(f'/users/{carol["id"]}/toggle', {}, headers={'Cookie': self.cookie})
+        self.assertEqual(status, 303)
+        self.assertTrue(self.user_named('carol@example.com')['is_active'])
+        self.assertEqual(self.login('carol@example.com', 'password123')[0], 303)  # active: signs in
+
+    def test_non_admin_cannot_manage_users(self):
+        self.register('bob@example.com', 'password123')
+        bob = self.user_named('bob@example.com')
+        self.store.set_user_active(bob['id'], True)
+        cookie = self.cookie_from(self.login('bob@example.com', 'password123')[2])
+        self.assertEqual(self.request('/users', headers={'Cookie': cookie}, auth=False)[0], 403)
+        self.assertEqual(self.form(f'/users/{self.user["id"]}/toggle', {}, headers={'Cookie': cookie})[0], 403)
+        self.assertTrue(self.user_named('admin@example.com')['is_active'])
+
+    def test_admin_cannot_deactivate_self(self):
+        status, body, _ = self.form(f'/users/{self.user["id"]}/toggle', {}, headers={'Cookie': self.cookie})
+        self.assertEqual(status, 400)
+        self.assertTrue(self.user_named('admin@example.com')['is_active'])
+
+    def test_deactivation_revokes_open_sessions(self):
+        self.register('bob@example.com', 'password123')
+        bob = self.user_named('bob@example.com')
+        self.store.set_user_active(bob['id'], True)
+        cookie = self.cookie_from(self.login('bob@example.com', 'password123')[2])
+        self.assertEqual(self.request('/me', headers={'Cookie': cookie}, auth=False)[0], 200)
+        self.store.set_user_active(bob['id'], False)
+        self.assertEqual(self.request('/me', headers={'Cookie': cookie}, auth=False)[0], 401)
+
+    def test_csrf_cross_origin_post_is_blocked(self):
+        status, _, _ = self.form('/login', {'email': 'admin@example.com', 'password': 'hunter2hunter'},
+                                 headers={'Origin': 'http://evil.example'})
+        self.assertEqual(status, 403)
+
+    def test_api_token_authenticates_and_regeneration_revokes_the_old_one(self):
+        old, new = self.api_token, self.store.regenerate_token(self.user['id'])
+        self.assertNotEqual(old, new)
+        probe = {'id': 'a' * 32}
+        self.assertEqual(self.request('/status', probe, headers={'Cookie': f'{SESSION_COOKIE}={old}'}, auth=False)[0], 401)
+        # The new token authenticates (an unknown id then yields 404, never 401).
+        self.assertEqual(self.request('/status', probe, headers={'Cookie': f'{SESSION_COOKIE}={new}'}, auth=False)[0], 404)
+
+    def test_registration_validation_rejects_bad_input(self):
+        self.assertIn(b'already exists', self.register('admin@example.com', 'password123')[1])
+        self.assertIn(b'Password must be', self.register('new@example.com', 'short')[1])
+        self.assertIn(b'do not match', self.register('new@example.com', 'password123', password2='different123')[1])
+        self.assertIn(b'valid email', self.register('not-an-email', 'password123')[1])
+        self.assertEqual([u['email'] for u in self.store.list_users()], ['admin@example.com'])
+
+    def test_users_page_escapes_email(self):
+        self.store.create_user('<b>"x"@example.com', 'password123')
+        status, body, _ = self.request('/users', headers={'Cookie': self.cookie}, auth=False)
+        self.assertEqual(status, 200)
+        self.assertNotIn(b'<b>"x"', body)
+        self.assertIn(b'&lt;b&gt;', body)
+
+    def test_no_users_redirects_to_registration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(directory, clock=lambda: self.now)
+            server = Server(('127.0.0.1', 0), store)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                for path in ('/', '/login'):
+                    conn = http.client.HTTPConnection(*server.server_address, timeout=5)
+                    conn.request('GET', path)
+                    response = conn.getresponse()
+                    response.read()
+                    self.assertEqual((response.status, dict(response.getheaders())['Location']), (303, '/register'))
+                    conn.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join()
+
+    def test_secure_cookie_set_behind_https_proxy(self):
+        self.server.trust_proxy = True
+        _, _, headers = self.login('admin@example.com', 'hunter2hunter', headers={'X-Forwarded-Proto': 'https'})
+        self.assertIn('Secure', headers['Set-Cookie'])
+
     def browser_upload(self, source, server_url, *args):
         self.now = time.time()  # The page compares expiry with the real clock.
         root = Path(__file__).resolve().parents[1]
         process = subprocess.run(['node', str(root / 'tests' / 'browser_upload.mjs'), str(root / 'web' / 'app.js'),
-                                  server_url, str(source), *args], capture_output=True, text=True, timeout=60)
+                                  server_url, str(source), *args], capture_output=True, text=True, timeout=60,
+                                 env={**os.environ, 'GETOUT_TOKEN': self.api_token})
         self.assertEqual(process.returncode, 0, process.stderr)
         return json.loads(process.stdout)
 
@@ -419,6 +579,7 @@ class ServiceTests(unittest.TestCase):
         url = 'http://%s:%s' % self.server.server_address
         env = dict(os.environ)
         env['NO_PROXY'] = env.get('NO_PROXY', '') + ',127.0.0.1,localhost'
+        env['GETOUT_TOKEN'] = self.api_token
         if environment:
             env.update(environment)
         process = subprocess.run([shutil.which('dash') or 'sh', str(script), '--server-url', url,
@@ -457,7 +618,7 @@ class ServiceTests(unittest.TestCase):
         source.write_bytes(b'')
         self.shell_upload(source, secrets.token_hex(16))
         script = Path(__file__).resolve().parents[1] / 'Upload-File.sh'
-        env = {**os.environ, 'NO_PROXY': '127.0.0.1,localhost'}
+        env = {**os.environ, 'NO_PROXY': '127.0.0.1,localhost', 'GETOUT_TOKEN': self.api_token}
         url = 'http://%s:%s' % self.server.server_address
         process = subprocess.run(['sh', str(script), '--server-url', url, '--path', str(source), '--expires-hours', '0.5'],
                                  env=env, capture_output=True, text=True, timeout=30)
@@ -535,7 +696,8 @@ exec "$REAL_CURL" "$@"
         # The first run passes the ID as someone might type it by hand.
         for typed_id in (' ' + words[0].upper() + '  ' + ' '.join(words[1:]), transfer_id):
             process = subprocess.run(['pwsh', '-NoProfile', '-NonInteractive', '-Command',
-                                      "$ErrorActionPreference='Stop'; " + command(typed_id)], capture_output=True, text=True, timeout=30)
+                                      "$ErrorActionPreference='Stop'; " + command(typed_id)], capture_output=True,
+                                     text=True, timeout=30, env={**os.environ, 'GETOUT_TOKEN': self.api_token})
             self.assertEqual(process.returncode, 0, process.stderr)
             result = json.loads(output.read_text(encoding='utf-8-sig'))
             self.assertEqual(result['TransferId'], transfer_id)

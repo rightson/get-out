@@ -6,10 +6,12 @@ export LC_ALL
 
 usage() {
     cat <<'EOF'
-Usage: sh Upload-File.sh --server-url URL --path FILE --expires-hours H [options]
+Usage: GETOUT_TOKEN=... sh Upload-File.sh --server-url URL --path FILE --expires-hours H [options]
   --server-url URL   HTTPS service URL (HTTP allowed only on loopback)
   --path FILE        File to upload
   --expires-hours H  Download link lifetime after upload, 0.1 to 24 hours
+  --token TOKEN      Script access token from the upload page (or set GETOUT_TOKEN).
+                     Uploading requires signing in; the token travels as your session.
   --ask-password     Require a download password (read from the terminal, or the first line of stdin)
   --transfer-id ID   Four words from the upload page (e.g. acorn-tulip-gravy-snore)
                      or 32 hex characters; reuse to resume the same file
@@ -28,11 +30,12 @@ file_path=
 transfer_id=
 max_attempts=5
 expires_hours=
+token_value=
 ask_password=0
 open_result=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --server-url|--path|--transfer-id|--max-attempts|--expires-hours)
+        --server-url|--path|--transfer-id|--max-attempts|--expires-hours|--token)
             [ "$#" -ge 2 ] || die "Missing value for $1"
             case "$1" in
                 --server-url) server_url=$2 ;;
@@ -40,6 +43,7 @@ while [ "$#" -gt 0 ]; do
                 --transfer-id) transfer_id=$2 ;;
                 --max-attempts) max_attempts=$2 ;;
                 --expires-hours) expires_hours=$2 ;;
+                --token) token_value=$2 ;;
             esac
             shift 2 ;;
         --open-result) open_result=1; shift ;;
@@ -53,6 +57,10 @@ done
 printf '%s\n' "$expires_hours" | awk '/^(0|[1-9][0-9]?)(\.[0-9][0-9]?)?$/ && $1 >= 0.1 && $1 <= 24 { ok = 1 } END { exit !ok }' ||
     die '--expires-hours must be from 0.1 to 24.'
 case "$max_attempts" in 1|2|3|4|5|6|7|8|9|10) ;; *) die '--max-attempts must be from 1 to 10.' ;; esac
+# Uploading requires a signed-in account; the token stands in for the browser session cookie.
+token_value=${token_value:-${GETOUT_TOKEN:-}}
+[ -n "$token_value" ] || die 'Set GETOUT_TOKEN (or pass --token) to the script access token shown on the upload page; uploading requires signing in.'
+printf '%s\n' "$token_value" | grep -Eqx '[a-f0-9]{64}' || die 'Token must be 64 hexadecimal characters (copy it from the upload page).'
 for tool in curl jq base64 dd od tr awk wc mkdir rm; do
     command -v "$tool" >/dev/null 2>&1 || die "Required command is missing: $tool"
 done
@@ -86,8 +94,11 @@ printf '%s\n' "$transfer_id" | grep -Eqx '[a-f0-9]{32}|[a-z]{3,5}(-[a-z]{3,5}){3
 
 # Exclusive mkdir and restrictive permissions avoid relying on a non-POSIX mktemp.
 umask 077
-work_dir=${TMPDIR:-/tmp}/lets-escape-$transfer_id-$$
+work_dir=${TMPDIR:-/tmp}/get-out-$transfer_id-$$
 mkdir "$work_dir" || die 'Could not create a private temporary directory.'
+# Keep the token out of argv (the process list): curl reads the Cookie header from a private file.
+printf 'Cookie: getout_session=%s\n' "$token_value" > "$work_dir/cookie"
+unset token_value GETOUT_TOKEN
 # Restore terminal echo if interrupted at the password prompt.
 trap 'rm -rf "$work_dir"; if [ "$ask_password" -eq 1 ] && [ -t 0 ]; then stty echo; fi' 0
 trap 'exit 130' INT
@@ -144,6 +155,7 @@ get() (
         if code=$(curl --disable --silent --get --globoff --proto '=http,https' \
             --connect-timeout 10 --max-time 60 \
             --header 'Cache-Control: no-store, no-cache' --header 'Pragma: no-cache' \
+            --header "@$work_dir/cookie" \
             --output "$work_dir/response.json" --write-out '%{http_code}' \
             "$server_url$endpoint" "$@" 2>/dev/null); then
             case "$code" in
@@ -151,6 +163,7 @@ get() (
                     if jq -e 'type == "object"' "$work_dir/response.json" >/dev/null 2>&1; then
                         exit 0
                     fi ;;
+                401) die 'Sign-in required or expired: set GETOUT_TOKEN to a current script access token from the upload page.' ;;
                 408|429|5??) ;;
                 *) die "Upload request rejected (HTTP $code)." ;;
             esac

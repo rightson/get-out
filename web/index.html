@@ -3,14 +3,19 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Let's Escape · File transfer</title>
+  <title>get-out · File transfer</title>
   <link rel="stylesheet" href="style.css">
   <script src="app.js" defer></script>
 </head>
 <body>
+  <nav class="navbar">
+    <a class="brand" href="/"><span class="mark" aria-hidden="true">↗</span>get-out</a>
+    <div class="links"><a href="/" class="current">New transfer</a><a id="users-link" href="/users" hidden>Users</a></div>
+    <div class="account"><span class="who" id="who"></span>
+      <form method="post" action="/logout"><button type="submit">Sign out</button></form></div>
+  </nav>
   <main>
-    <header><span class="mark" aria-hidden="true">↗</span><span>LET'S ESCAPE</span><span class="pill" id="pill">Temporary file transfer</span></header>
-    <div class="intro"><p class="eyebrow">A small route for your files</p><h1>Send it in pieces.<br>Get it back whole.</h1><p class="lead">Upload from this page with acknowledged GET requests, or use a PowerShell or terminal script if your browser can't. Your download link appears here once every chunk is verified.</p></div>
+    <div class="intro"><p class="eyebrow">A small route for your files</p><h1>Send it in pieces.<br>Get it back whole.</h1><p class="lead">Upload from this page with acknowledged GET requests, or use a PowerShell or terminal script if your browser can't. Your download link appears here once every chunk is verified, and is safe to share with anyone — they don't need an account to download.</p></div>
     <section class="card" aria-labelledby="upload-title">
       <div class="section-top"><h2 id="upload-title">Start a transfer</h2><span class="step">01 — UPLOAD</span></div>
       <label for="file">File</label>
@@ -33,6 +38,10 @@
           <a class="button secondary" href="Upload-File.ps1" download>↓ PowerShell script</a>
           <a class="button secondary" href="Upload-File.sh" download>↓ Bash / POSIX sh script</a>
         </div>
+        <label>Script access token (signs the scripts in as you)</label>
+        <div class="transfer-line"><code id="cli-token">loading…</code><button id="copy-token" type="button">Copy token</button>
+          <form method="post" action="/token" class="inline"><button type="submit" title="Issue a new token and invalidate the old one">Regenerate</button></form></div>
+        <p class="hint">The scripts need this token so uploading stays behind your login. Set it first — PowerShell: <code>$Env:GETOUT_TOKEN = '…'</code>; shell: <code>export GETOUT_TOKEN='…'</code> — then run the command below. It travels as your session, never on the command line.</p>
         <label for="file-path">File path on your computer</label>
         <input id="file-path" type="text" placeholder="C:\Users\you\Downloads\report.zip" autocomplete="off" spellcheck="false">
         <div class="command-top"><label for="command">PowerShell — run from the script's folder</label><button id="copy" type="button">Copy command</button></div>
@@ -60,7 +69,7 @@
         <details><summary>SHA-256 checksum</summary><code id="checksum"></code></details>
       </div>
     </section>
-    <footer><p id="limits">1 KiB chunks · SHA-256 verified · Downloads expire automatically</p><p>Anyone with the download link (and its password, if set) can access the file. When a link expires, the file is deleted. The service keeps a record of each upload (IP address, time, file name, size, checksum) and each visit to a download link (IP address, time, browser, result). GET URLs may appear in network logs; use a service you trust.</p></footer>
+    <footer><p id="limits">1 KiB chunks · SHA-256 verified · Downloads expire automatically</p><p>Anyone with the download link (and its password, if set) can download the file without an account. When a link expires, the file is deleted. The service keeps a record of each upload (account, IP address, time, file name, size, checksum) and each visit to a download link (IP address, time, browser, result). GET URLs may appear in network logs; use a service you trust.</p></footer>
   </main>
 </body>
 </html>

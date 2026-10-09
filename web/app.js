@@ -7,7 +7,9 @@ let terminal = false;
 let polling = false;
 let uploading = false;
 let maxFileSize = Infinity;
+let token = ''; // The signed-in account's script access token, shown for the CLI fallback.
 let transferReady; // Settles once setTransfer has chosen the current ID (it may wait for the word list).
+function signInAgain() { window.location.assign('/login'); }
 const ID_PATTERN = /^(?:[a-f0-9]{32}|[a-z]{3,5}(?:-[a-z]{3,5}){3})$/;
 // Transfer IDs are four words from the server's list; fall back to 128 random bits if it is unavailable.
 const words = fetch(`${baseUrl}/words.txt`, { cache: 'no-store' })
@@ -104,6 +106,7 @@ async function call(path, params, headers = {}) {
       response = await fetch(url, { cache: 'no-store', referrerPolicy: 'no-referrer', headers });
     } catch { /* Network failure: retry below. */ }
     if (response?.ok) return response.json();
+    if (response && response.status === 401) { signInAgain(); throw new UploadError('Your session has expired — sign in again.'); }
     const retry = !response || response.status === 408 || response.status === 429 || response.status >= 500;
     if (!retry || attempt === 5) {
       if (!response) throw new UploadError('The browser could not reach the server.', true);
@@ -191,6 +194,7 @@ async function poll() {
   try {
     const response = await fetch(`${baseUrl}/status?id=${requestedId}`, { cache: 'no-store', referrerPolicy: 'no-referrer' });
     if (requestedId !== transferId) return;
+    if (response.status === 401) { signInAgain(); return; }
     if (response.status === 404 && !seen) return;
     if (response.status === 404 || response.status === 410) {
       showError('This transfer has expired');
@@ -265,6 +269,7 @@ $('drop-zone').addEventListener('drop', (event) => {
 });
 $('copy').addEventListener('click', () => copy($('command').value, $('copy')));
 $('copy-shell').addEventListener('click', () => copy($('shell-command').value, $('copy-shell')));
+$('copy-token').addEventListener('click', () => copy(token, $('copy-token')));
 $('copy-link').addEventListener('click', () => copy($('download-link').value, $('copy-link')));
 $('new-transfer').addEventListener('click', async () => {
   window.location.hash = 'id=' + await newId();
@@ -272,6 +277,17 @@ $('new-transfer').addEventListener('click', async () => {
 window.addEventListener('hashchange', () => { transferReady = setTransfer().then(poll); });
 transferReady = setTransfer().then(poll);
 setInterval(poll, 2500);
+// Confirm the session and show the account; an expired session sends us back to sign in.
+fetch(`${baseUrl}/me`, { cache: 'no-store' }).then((r) => {
+  if (r.status === 401) { signInAgain(); return null; }
+  return r.ok ? r.json() : null;
+}).then((me) => {
+  if (!me) return;
+  token = me.token || '';
+  $('who').textContent = me.email || '';
+  if (me.is_admin) $('users-link').hidden = false;
+  $('cli-token').textContent = token || '(unavailable)';
+}).catch(() => {});
 fetch(`${baseUrl}/config`, { cache: 'no-store' }).then((r) => r.json()).then((config) => {
   maxFileSize = config.max_file_size;
   $('limits').textContent = `${config.chunk_size.toLocaleString()}-byte chunks · Maximum ${(config.max_file_size / 1024 / 1024).toLocaleString()} MiB per file · You choose when the link disappears (${duration(config.min_ttl_hours)} to ${duration(config.max_ttl_hours)})`;
