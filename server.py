@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Durable GET-only chunk uploads. Python 3.12+, no third-party dependencies."""
+"""get-out: durable GET-only chunk uploads behind an invite-only login. Python 3.12+, no third-party dependencies."""
 import argparse
 import base64
 from contextlib import contextmanager
 import hashlib
 import hmac
+import html
 import json
 import logging
 import math
@@ -17,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlsplit
 
@@ -31,6 +33,15 @@ WORDS = frozenset((ROOT / "web" / "words.txt").read_text().split())
 ID_WORDS = 4
 ID_RE = re.compile(r"(?:[a-f0-9]{32}|[a-z]{3,5}(?:-[a-z]{3,5}){%d})\Z" % (ID_WORDS - 1))
 HASH_RE = re.compile(r"[a-f0-9]{64}\Z")
+# Accounts are invite-only (see README): the first person to register becomes the
+# administrator and everyone after that stays inactive until an admin activates them.
+EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+\Z")
+MIN_PASSWORD, MAX_PASSWORD = 8, 128
+MAX_EMAIL = 150
+SESSION_TTL = 30 * 24 * 60 * 60
+SESSION_COOKIE = "getout_session"
+# The CLI clients send their token in this cookie too, so uploading cannot bypass the login.
+MAX_FORM_BYTES = 64 * 1024
 
 
 class APIError(Exception):
@@ -48,6 +59,11 @@ def password_matches(stored, password):
     if stored is None or password is None:
         return stored is None and password is None
     return hmac.compare_digest(hash_password(password, bytes.fromhex(stored.split("$")[0])), stored)
+
+
+# A throwaway hash so an unknown email still costs one scrypt at login: a missing account must not
+# answer faster than a wrong password, or the timing gap would enumerate registered addresses.
+DECOY_HASH = hash_password(secrets.token_hex(16))
 
 
 class Store:
@@ -79,7 +95,7 @@ class Store:
                 -- Audit records outlive transfers: cleanup never deletes them.
                 CREATE TABLE IF NOT EXISTS upload_log (
                   token TEXT PRIMARY KEY, transfer_id TEXT NOT NULL, ip TEXT NOT NULL,
-                  name TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL,
+                  uploader TEXT, name TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL,
                   ttl REAL NOT NULL, password INTEGER NOT NULL, started REAL NOT NULL,
                   state TEXT NOT NULL, completed REAL, expires REAL, deleted REAL
                 );
@@ -88,6 +104,24 @@ class Store:
                   ip TEXT NOT NULL, result TEXT NOT NULL, user_agent TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS access_log_token ON access_log(token);
+                -- Invite-only accounts. The first account registered is the administrator; the
+                -- rest stay is_active=0 until an admin turns them on. Passwords are scrypt hashes.
+                -- api_token is a high-entropy bearer credential the CLI clients send as a cookie;
+                -- it is stored in the clear so the signed-in page can show it for the script fallback.
+                CREATE TABLE IF NOT EXISTS users (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL UNIQUE,
+                  password TEXT NOT NULL, api_token TEXT NOT NULL UNIQUE,
+                  is_active INTEGER NOT NULL DEFAULT 0, is_admin INTEGER NOT NULL DEFAULT 0,
+                  created REAL NOT NULL, last_login REAL
+                );
+                -- Browser sessions. Only the SHA-256 of the cookie value is stored, so a database
+                -- read never yields a live session credential.
+                CREATE TABLE IF NOT EXISTS sessions (
+                  token_hash TEXT PRIMARY KEY,
+                  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                  created REAL NOT NULL, expires REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
             """)
             # Databases created before per-transfer expiry and passwords.
             columns = {r[1] for r in conn.execute("PRAGMA table_info(transfers)")}
@@ -95,6 +129,9 @@ class Store:
                 conn.execute("ALTER TABLE transfers ADD COLUMN ttl REAL NOT NULL DEFAULT 3600")
             if "password" not in columns:
                 conn.execute("ALTER TABLE transfers ADD COLUMN password TEXT")
+            # Databases created before uploads were attributed to signed-in accounts.
+            if "uploader" not in {r[1] for r in conn.execute("PRAGMA table_info(upload_log)")}:
+                conn.execute("ALTER TABLE upload_log ADD COLUMN uploader TEXT")
         self.cleanup()
 
     @contextmanager
@@ -140,7 +177,7 @@ class Store:
             result["download_url"] = "/download/" + row["token"]
         return result
 
-    def start(self, params, ip, password=None):
+    def start(self, params, ip, password=None, uploader=None):
         transfer_id = self.transfer_id(params["id"])
         name, digest = params["name"], params["sha256"]
         size = self.integer(params["size"])
@@ -174,9 +211,9 @@ class Store:
                          (transfer_id, name, size, digest, max(1, math.ceil(size / self.chunk_size)),
                           self.chunk_size, now, now + UPLOAD_WINDOW, token, ttl,
                           None if password is None else hash_password(password)))
-            conn.execute("INSERT INTO upload_log(token,transfer_id,ip,name,size,sha256,ttl,password,started,state) "
-                         "VALUES(?,?,?,?,?,?,?,?,?,'uploading')",
-                         (token, transfer_id, ip, name, size, digest, ttl, password is not None, now))
+            conn.execute("INSERT INTO upload_log(token,transfer_id,ip,uploader,name,size,sha256,ttl,password,started,state) "
+                         "VALUES(?,?,?,?,?,?,?,?,?,?,'uploading')",
+                         (token, transfer_id, ip, uploader, name, size, digest, ttl, password is not None, now))
             return self.result(self.get(conn, transfer_id))
 
     def receive(self, params):
@@ -267,6 +304,118 @@ class Store:
                 result["missing"] = [i for i in range(row["total"]) if i not in received][:1024]
             return result
 
+    # --- Accounts and sessions (invite-only login) ----------------------------
+
+    @staticmethod
+    def normalize_email(value):
+        email = (value or "").strip().lower()
+        if not EMAIL_RE.fullmatch(email) or len(email) > MAX_EMAIL:
+            raise APIError(400, "Enter a valid email address")
+        return email
+
+    def any_users(self):
+        with self.connect() as conn:
+            return conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None
+
+    def create_user(self, email, password):
+        """Register an account. The first one becomes the active admin; the rest start inactive."""
+        email = self.normalize_email(email)
+        if not MIN_PASSWORD <= len(password) <= MAX_PASSWORD:
+            raise APIError(400, f"Password must be {MIN_PASSWORD} to {MAX_PASSWORD} characters")
+        token = secrets.token_hex(32)
+        # scrypt is deliberately slow; compute it before taking the write lock so a flood of
+        # registrations cannot serialise every other writer behind it.
+        password_hash = hash_password(password)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            # The check-and-insert runs in one transaction so two simultaneous first sign-ups
+            # cannot both become administrators.
+            first = conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is None
+            try:
+                conn.execute(
+                    "INSERT INTO users(email,password,api_token,is_active,is_admin,created) VALUES(?,?,?,?,?,?)",
+                    (email, password_hash, token, int(first), int(first), self.clock()))
+            except sqlite3.IntegrityError:
+                raise APIError(409, "An account with this email already exists") from None
+            user = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+        return user, first
+
+    def verify_credentials(self, email, password):
+        """Return (user_row_or_None, reason) where reason is 'ok', 'inactive', or 'invalid'."""
+        try:
+            email = self.normalize_email(email)
+        except APIError:
+            return None, "invalid"
+        with self.connect() as conn:
+            user = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+        # Always run exactly one scrypt, against a decoy when the account is unknown, so timing does
+        # not reveal whether the email is registered.
+        matches = password_matches(user["password"] if user is not None else DECOY_HASH, password)
+        if user is None or not matches:
+            return None, "invalid"
+        return (user, "ok") if user["is_active"] else (user, "inactive")
+
+    def start_session(self, user_id):
+        token = secrets.token_hex(32)
+        now = self.clock()
+        with self.connect() as conn:
+            conn.execute("INSERT INTO sessions(token_hash,user_id,created,expires) VALUES(?,?,?,?)",
+                         (hashlib.sha256(token.encode()).hexdigest(), user_id, now, now + SESSION_TTL))
+            conn.execute("UPDATE users SET last_login=? WHERE id=?", (now, user_id))
+        return token
+
+    def end_session(self, token):
+        if token and HASH_RE.fullmatch(token):
+            with self.connect() as conn:
+                conn.execute("DELETE FROM sessions WHERE token_hash=?",
+                             (hashlib.sha256(token.encode()).hexdigest(),))
+
+    def user_for_cookie(self, token):
+        """Resolve a cookie value to an active user: a browser session first, then a CLI api_token."""
+        if not token or not HASH_RE.fullmatch(token):
+            return None
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id "
+                "WHERE s.token_hash=? AND s.expires>? AND u.is_active=1",
+                (hashlib.sha256(token.encode()).hexdigest(), self.clock())).fetchone()
+            if row is None:
+                row = conn.execute("SELECT * FROM users WHERE api_token=? AND is_active=1", (token,)).fetchone()
+        return row
+
+    def list_users(self):
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM users ORDER BY created, id").fetchall()
+
+    def set_user_active(self, user_id, active):
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            user = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+            if user is None:
+                raise APIError(404, "No such user")
+            conn.execute("UPDATE users SET is_active=? WHERE id=?", (int(bool(active)), user_id))
+            if not active:  # A deactivated account must not keep an open session.
+                conn.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+        return user
+
+    def toggle_user(self, user_id):
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            user = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+            if user is None:
+                raise APIError(404, "No such user")
+            active = 0 if user["is_active"] else 1
+            conn.execute("UPDATE users SET is_active=? WHERE id=?", (active, user_id))
+            if not active:  # Revoke open sessions when deactivating.
+                conn.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+        return active
+
+    def regenerate_token(self, user_id):
+        token = secrets.token_hex(32)
+        with self.connect() as conn:
+            conn.execute("UPDATE users SET api_token=? WHERE id=?", (token, user_id))
+        return token
+
     def log_access(self, token, ip, agent, result):
         # Only tokens the service issued are recorded, so random probes cannot grow the log.
         with self.connect() as conn:
@@ -291,7 +440,7 @@ class Store:
         # Check the password outside the write lock: scrypt is deliberately slow.
         if row["password"] is not None and not password_matches(row["password"], password):
             raise deny(401, "password_required" if password is None else "wrong_password", "Download password required",
-                       {"WWW-Authenticate": 'Basic realm="Let\'s Escape download", charset="UTF-8"'})
+                       {"WWW-Authenticate": 'Basic realm="get-out download", charset="UTF-8"'})
         with self.connect() as conn:
             # Coordinate file open with cleanup; streaming can continue on the open descriptor.
             conn.execute("BEGIN IMMEDIATE")
@@ -304,6 +453,7 @@ class Store:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             now = self.clock()
+            conn.execute("DELETE FROM sessions WHERE expires<=?", (now,))
             for row in conn.execute("SELECT id, token FROM transfers WHERE expires<=?", (now,)).fetchall():
                 (self.files / row[0]).unlink(missing_ok=True)
                 conn.execute("DELETE FROM transfers WHERE id=?", (row[0],))
@@ -328,15 +478,15 @@ def audit_report(directory, out=sys.stdout):
     utc = lambda t: "-" if t is None else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
     try:
         print("UPLOADS", file=out)
-        print("started_utc\tip\ttransfer_id\tname\tsize\tsha256\tpassword\tttl_hours\tstate"
+        print("started_utc\tip\tuploader\ttransfer_id\tname\tsize\tsha256\tpassword\tttl_hours\tstate"
               "\tcompleted_utc\texpires_utc\tdeleted_utc\tclicks\tdownloads", file=out)
         for r in conn.execute("""
-                SELECT u.started, u.ip, u.transfer_id, u.name, u.size, u.sha256, u.password, u.ttl, u.state,
-                       u.completed, u.expires, u.deleted, COUNT(a.token), COALESCE(SUM(a.result='downloaded'),0)
+                SELECT u.started, u.ip, u.uploader, u.transfer_id, u.name, u.size, u.sha256, u.password, u.ttl,
+                       u.state, u.completed, u.expires, u.deleted, COUNT(a.token), COALESCE(SUM(a.result='downloaded'),0)
                 FROM upload_log u LEFT JOIN access_log a ON a.token=u.token
                 GROUP BY u.token ORDER BY u.started"""):
-            print("\t".join(map(str, (utc(r[0]), r[1], r[2], r[3], r[4], r[5], "yes" if r[6] else "no",
-                                      round(r[7] / 3600, 2), r[8], utc(r[9]), utc(r[10]), utc(r[11]), r[12], r[13]))),
+            print("\t".join(map(str, (utc(r[0]), r[1], r[2] or "-", r[3], r[4], r[5], r[6], "yes" if r[7] else "no",
+                                      round(r[8] / 3600, 2), r[9], utc(r[10]), utc(r[11]), utc(r[12]), r[13], r[14]))),
                   file=out)
         print("\nACCESSES", file=out)
         print("at_utc\tip\tresult\ttransfer_id\tname\tuser_agent", file=out)
@@ -345,6 +495,92 @@ def audit_report(directory, out=sys.stdout):
             print("\t".join(map(str, (utc(r[0]), *r[1:]))), file=out)
     finally:
         conn.close()
+
+
+AWAITING = "Your account is awaiting activation by an administrator."
+
+
+def _page(title, body):
+    return ("<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+            f"<title>{html.escape(title)}</title>\n<link rel=\"stylesheet\" href=\"/style.css\">\n"
+            "</head>\n<body class=\"auth\">\n" + body + "\n</body>\n</html>\n").encode()
+
+
+def _notice(message, tone):
+    return f'<p class="msg {tone}" role="alert">{html.escape(message)}</p>' if message else ""
+
+
+def login_page(*, message=None, tone="info", email=""):
+    return _page("Sign in · get-out", f"""<main class="auth-card">
+  <header><span class="mark" aria-hidden="true">↗</span><span>GET-OUT</span></header>
+  <h1>Welcome back</h1>
+  <p class="lead">Sign in to send your files in pieces.</p>
+  {_notice(message, tone)}
+  <form method="post" action="/login">
+    <label for="email">Email</label>
+    <input id="email" name="email" type="email" required autofocus autocomplete="username" value="{html.escape(email)}">
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" required autocomplete="current-password">
+    <button class="button" type="submit">Sign in</button>
+  </form>
+  <p class="switch">New here? <a href="/register">Create an account</a></p>
+</main>""")
+
+
+def register_page(*, message=None, tone="error", email="", first=False):
+    intro = ("You are the first user, so this account becomes the administrator and is active immediately."
+             if first else
+             "Invite-only: after you register, an administrator must activate your account before you can sign in.")
+    return _page("Create account · get-out", f"""<main class="auth-card">
+  <header><span class="mark" aria-hidden="true">↗</span><span>GET-OUT</span></header>
+  <h1>Create your account</h1>
+  <p class="lead">{intro}</p>
+  {_notice(message, tone)}
+  <form method="post" action="/register">
+    <label for="email">Email</label>
+    <input id="email" name="email" type="email" required autofocus autocomplete="email" value="{html.escape(email)}">
+    <label for="password">Password (at least 8 characters)</label>
+    <input id="password" name="password" type="password" required autocomplete="new-password" minlength="8" maxlength="128">
+    <label for="password2">Password (again)</label>
+    <input id="password2" name="password2" type="password" required autocomplete="new-password" minlength="8" maxlength="128">
+    <button class="button" type="submit">Create account</button>
+  </form>
+  <p class="switch">Already registered? <a href="/login">Sign in</a></p>
+</main>""")
+
+
+def nav(user):
+    links = '<a href="/">New transfer</a>' + ('<a href="/users">Users</a>' if user["is_admin"] else "")
+    return (f'<nav class="navbar"><a class="brand" href="/"><span class="mark" aria-hidden="true">↗</span>get-out</a>'
+            f'<div class="links">{links}</div>'
+            f'<div class="account"><span class="who">{html.escape(user["email"])}</span>'
+            f'<form method="post" action="/logout"><button type="submit">Sign out</button></form></div></nav>')
+
+
+def users_page(users, current):
+    rows = []
+    for u in users:
+        badges = ('<span class="badge active">Active</span>' if u["is_active"]
+                  else '<span class="badge inactive">Inactive</span>')
+        if u["is_admin"]:
+            badges += ' <span class="badge admin">Admin</span>'
+        if u["id"] == current["id"]:
+            cell = ('<span class="you">That’s you</span>'
+                    '<button type="button" disabled title="You cannot change your own account">Deactivate</button>')
+        else:
+            label = "Deactivate" if u["is_active"] else "Activate"
+            cell = (f'<form method="post" action="/users/{u["id"]}/toggle">'
+                    f'<button class="button small" type="submit">{label}</button></form>')
+        rows.append(f'<tr><td class="email">{html.escape(u["email"])}</td><td>{badges}</td><td class="act">{cell}</td></tr>')
+    return _page("Users · get-out", nav(current) + f"""<main class="users">
+  <h1>Users</h1>
+  <p class="lead">New accounts stay inactive until activated here. Inactive accounts cannot sign in or upload.</p>
+  <table>
+    <thead><tr><th>Email</th><th>Status</th><th></th></tr></thead>
+    <tbody>{"".join(rows)}</tbody>
+  </table>
+</main>""")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -368,6 +604,75 @@ class Handler(BaseHTTPRequestHandler):
             return base64.b64decode(value.strip(), validate=True).decode("utf-8").partition(":")[2]
         except (ValueError, UnicodeError):
             raise APIError(400, "Malformed Authorization header") from None
+
+    def session_token(self):
+        raw = self.headers.get("Cookie")
+        if not raw:
+            return None
+        try:
+            jar = SimpleCookie()
+            jar.load(raw)
+        except CookieError:
+            return None
+        morsel = jar.get(SESSION_COOKIE)
+        return morsel.value if morsel else None
+
+    def current_user(self):
+        # Resolve per request. A handler instance is reused for every request on a keep-alive
+        # connection, so caching the result would let a logged-out, expired, or deactivated session
+        # keep access until the socket closed. Each route calls this at most once per request.
+        return self.server.store.user_for_cookie(self.session_token())
+
+    def require_user(self):
+        user = self.current_user()
+        if user is None:
+            raise APIError(401, "Sign in to upload")
+        return user
+
+    def same_origin(self):
+        # CSRF defence for state-changing POSTs, alongside the SameSite=Strict session cookie.
+        # Browsers always send Origin on a POST, so a forged cross-site POST is caught here even
+        # though our own Referrer-Policy: no-referrer suppresses Referer. A request with neither
+        # header is not a browser carrying out a cross-site attack (and the authenticated routes are
+        # additionally protected because the SameSite=Strict cookie is never sent cross-site).
+        host = self.headers.get("Host", "")
+        origin = self.headers.get("Origin")
+        if origin is not None:
+            return bool(host) and urlsplit(origin).netloc == host
+        referer = self.headers.get("Referer")
+        if referer:
+            return bool(host) and urlsplit(referer).netloc == host
+        return True
+
+    def read_form(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            raise APIError(400, "Invalid Content-Length") from None
+        if not 0 <= length <= MAX_FORM_BYTES:
+            raise APIError(413, "Form submission too large")
+        body = self.rfile.read(length).decode("utf-8", "replace") if length else ""
+        parsed = parse_qs(body, keep_blank_values=True, max_num_fields=12)
+        return {key: values[0] for key, values in parsed.items()}
+
+    def secure_cookies(self):
+        if self.server.cookie_secure:
+            return True
+        return self.server.trust_proxy and self.headers.get("X-Forwarded-Proto", "").strip().lower() == "https"
+
+    def session_cookie(self, token):
+        attrs = f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL}"
+        return attrs + ("; Secure" if self.secure_cookies() else "")
+
+    def clear_cookie(self):
+        attrs = f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
+        return attrs + ("; Secure" if self.secure_cookies() else "")
+
+    def redirect(self, location, extra=None):
+        self.respond(303, b"", "text/plain; charset=utf-8", {"Location": location, **(extra or {})})
+
+    def send_html(self, status, body):
+        self.respond(status, body, "text/html; charset=utf-8")
 
     def headers_common(self):
         self.send_header("Cache-Control", "no-store, private, max-age=0")
@@ -404,6 +709,7 @@ class Handler(BaseHTTPRequestHandler):
             url = urlsplit(self.path)
             store = self.server.store
             if url.path in {"/start", "/receive", "/status"}:
+                user = self.require_user()  # Uploading is for signed-in, activated accounts only.
                 required = {"/start": {"id", "name", "size", "sha256", "ttl_hours"},
                             "/receive": {"id", "seq", "total", "data"}, "/status": {"id"}}[url.path]
                 query = parse_qs(url.query, keep_blank_values=True, max_num_fields=8, errors="strict")
@@ -419,7 +725,7 @@ class Handler(BaseHTTPRequestHandler):
                 # The optional download password travels in a Basic Authorization header, never the URL.
                 try:
                     result = store.status(params["id"]) if url.path == "/status" else (
-                        store.start(params, ip, self.basic_password()) if url.path == "/start"
+                        store.start(params, ip, self.basic_password(), user["email"]) if url.path == "/start"
                         else store.receive(params))
                 except APIError as error:
                     if error.status == 404 and url.path != "/start":
@@ -451,9 +757,41 @@ class Handler(BaseHTTPRequestHandler):
             elif url.path == "/config":
                 self.respond(200, {"chunk_size": store.chunk_size, "max_file_size": store.max_file,
                                    "min_ttl_hours": MIN_TTL / 3600, "max_ttl_hours": MAX_TTL / 3600})
+            elif url.path == "/me":
+                user = self.require_user()
+                self.respond(200, {"email": user["email"], "is_admin": bool(user["is_admin"]),
+                                   "token": user["api_token"]})
+            elif url.path == "/login":
+                if self.current_user():
+                    self.redirect("/")
+                elif not store.any_users():
+                    self.redirect("/register")
+                else:
+                    message = AWAITING if parse_qs(url.query).get("m", [""])[0] == "awaiting" else None
+                    self.send_html(200, login_page(message=message))
+            elif url.path == "/register":
+                if self.current_user():
+                    self.redirect("/")
+                else:
+                    self.send_html(200, register_page(first=not store.any_users()))
+            elif url.path == "/users":
+                user = self.current_user()
+                if user is None:
+                    self.redirect("/login")
+                elif not user["is_admin"]:
+                    raise APIError(403, "Administrators only")
+                else:
+                    self.send_html(200, users_page(store.list_users(), user))
+            elif url.path == "/":
+                if not store.any_users():
+                    self.redirect("/register")
+                elif self.current_user() is None:
+                    self.redirect("/login")
+                else:
+                    self.respond(200, (ROOT / "web/index.html").read_bytes(), "text/html; charset=utf-8")
             else:
-                assets = {"/": ("web/index.html", "text/html; charset=utf-8"),
-                          "/app.js": ("web/app.js", "text/javascript; charset=utf-8"),
+                # Inert static assets stay public; the signed-in upload page fetches them.
+                assets = {"/app.js": ("web/app.js", "text/javascript; charset=utf-8"),
                           "/style.css": ("web/style.css", "text/css; charset=utf-8"),
                           "/words.txt": ("web/words.txt", "text/plain; charset=utf-8"),
                           "/Upload-File.ps1": ("Upload-File.ps1", "text/plain; charset=utf-8"),
@@ -466,6 +804,72 @@ class Handler(BaseHTTPRequestHandler):
         except APIError as error:
             self.respond(error.status, {"error": error.message}, extra=error.headers)
         except (ValueError, UnicodeError):
+            self.respond(400, {"error": "Malformed request"})
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            self.close_connection = True
+        except Exception:
+            logging.exception("Internal request failure (URL omitted)")
+            self.close_connection = True
+            self.respond(500, {"error": "Internal server error"})
+
+    def do_POST(self):
+        # The upload protocol is GET-only; POST exists only for the login/account forms.
+        try:
+            if len(self.path.encode()) > 2048:
+                raise APIError(414, "URL exceeds the 2048-byte limit")
+            store = self.server.store
+            path = urlsplit(self.path).path
+            toggle = re.fullmatch(r"/users/([1-9][0-9]{0,9})/toggle", path)
+            if path not in {"/login", "/register", "/logout", "/token"} and not toggle:
+                raise APIError(405, "Only GET is supported for this path", {"Allow": "GET"})
+            if not self.same_origin():
+                raise APIError(403, "Cross-origin request blocked")
+            form = self.read_form()
+            if path == "/register":
+                email, password, password2 = form.get("email", ""), form.get("password", ""), form.get("password2", "")
+                first = not store.any_users()
+                if password != password2:
+                    return self.send_html(200, register_page(message="The two passwords do not match.",
+                                                             email=email, first=first))
+                try:
+                    user, first = store.create_user(email, password)
+                except APIError as error:
+                    return self.send_html(200, register_page(message=error.message, email=email, first=first))
+                if first:  # The first account is the active admin and is signed in straight away.
+                    token = store.start_session(user["id"])
+                    return self.redirect("/", {"Set-Cookie": self.session_cookie(token)})
+                return self.redirect("/login?m=awaiting")
+            if path == "/login":
+                user, reason = store.verify_credentials(form.get("email", ""), form.get("password", ""))
+                if reason == "ok":
+                    token = store.start_session(user["id"])
+                    return self.redirect("/", {"Set-Cookie": self.session_cookie(token)})
+                message = AWAITING if reason == "inactive" else "Invalid email or password."
+                return self.send_html(200, login_page(message=message, tone="info" if reason == "inactive" else "error",
+                                                       email=form.get("email", "")))
+            if path == "/logout":
+                store.end_session(self.session_token())
+                return self.redirect("/login", {"Set-Cookie": self.clear_cookie()})
+            # The remaining routes act on the signed-in account.
+            user = self.current_user()
+            if user is None:
+                return self.redirect("/login")
+            if path == "/token":
+                store.regenerate_token(user["id"])
+                return self.redirect("/")
+            if not user["is_admin"]:
+                raise APIError(403, "Administrators only")
+            target = int(toggle.group(1))
+            if target == user["id"]:
+                raise APIError(400, "You cannot change your own account")
+            store.toggle_user(target)
+            self.redirect("/users")
+        except APIError as error:
+            # A rejected POST may still have an unread body; closing avoids desyncing keep-alive.
+            self.close_connection = True
+            self.respond(error.status, {"error": error.message}, extra=error.headers)
+        except (ValueError, UnicodeError):
+            self.close_connection = True
             self.respond(400, {"error": "Malformed request"})
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             self.close_connection = True
@@ -510,8 +914,8 @@ class Server(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 64
 
-    def __init__(self, address, store, trust_proxy=False, miss_limit=120):
-        self.store, self.trust_proxy = store, trust_proxy
+    def __init__(self, address, store, trust_proxy=False, miss_limit=120, cookie_secure=False):
+        self.store, self.trust_proxy, self.cookie_secure = store, trust_proxy, cookie_secure
         self.misses = MissLimiter(miss_limit, store.clock)
         self.slots = threading.BoundedSemaphore(32)
         super().__init__(address, Handler)
@@ -563,7 +967,7 @@ def watch(argv):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    parser = argparse.ArgumentParser(description="GET chunk upload service")
+    parser = argparse.ArgumentParser(description="get-out: invite-only GET chunk upload service")
     parser.add_argument("command", nargs="?", choices=("serve", "audit"), default="serve",
                         help="serve (default) or audit: print upload and download history")
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8080")),
@@ -571,7 +975,9 @@ def main(argv=None):
     parser.add_argument("--max-file-mb", type=float, default=float(os.environ.get("MAX_FILE_MB", "10")),
                         help="maximum file size in MiB (default: $MAX_FILE_MB or 10)")
     parser.add_argument("--trust-proxy", action="store_true", default=os.environ.get("TRUST_PROXY") == "1",
-                        help="log the client IP from X-Real-IP set by your reverse proxy (default: $TRUST_PROXY=1)")
+                        help="trust X-Real-IP and X-Forwarded-Proto from your reverse proxy (default: $TRUST_PROXY=1)")
+    parser.add_argument("--secure-cookies", action="store_true", default=os.environ.get("COOKIE_SECURE") == "1",
+                        help="mark the session cookie Secure even without a trusted X-Forwarded-Proto (default: $COOKIE_SECURE=1)")
     parser.add_argument("--watch", action="store_true",
                         help="development: restart the server when server.py changes")
     args = parser.parse_args(argv)
@@ -601,8 +1007,8 @@ def main(argv=None):
 
     threading.Thread(target=janitor, daemon=True).start()
     server = Server((os.environ.get("HOST", "127.0.0.1"), args.port), store, args.trust_proxy,
-                    int(os.environ.get("ID_MISS_LIMIT", "120")))
-    logging.info("Upload service listening on %s:%s", *server.server_address)
+                    int(os.environ.get("ID_MISS_LIMIT", "120")), args.secure_cookies)
+    logging.info("get-out listening on %s:%s", *server.server_address)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

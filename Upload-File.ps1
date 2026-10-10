@@ -3,7 +3,7 @@
 .SYNOPSIS
 Upload a file using acknowledged, resumable Base64URL GET requests.
 .EXAMPLE
-.\Upload-File.ps1 -ServerUrl https://upload.example.com -Path .\report.zip -ExpiresHours 1 -OpenResult
+$Env:GETOUT_TOKEN = '...'; .\Upload-File.ps1 -ServerUrl https://upload.example.com -Path .\report.zip -ExpiresHours 1 -OpenResult
 .EXAMPLE
 .\Upload-File.ps1 -ServerUrl https://upload.example.com -Path .\report.zip -ExpiresHours 0.5 -DownloadPassword (Read-Host 'Download password' -AsSecureString)
 #>
@@ -16,6 +16,8 @@ param(
     [securestring]$DownloadPassword,
     # Four words from the upload page (for example acorn-tulip-gravy-snore), or 32 hex characters.
     [string]$TransferId = [Guid]::NewGuid().ToString('N'),
+    # Script access token from the upload page; defaults to $Env:GETOUT_TOKEN. Uploading requires signing in.
+    [string]$Token,
     [ValidateRange(1, 10)][int]$MaxAttempts = 5,
     [switch]$OpenResult
 )
@@ -27,6 +29,11 @@ $TransferId = ($TransferId.Trim().ToLowerInvariant() -replace '[^a-z0-9]+', '-')
 if ($TransferId -cnotmatch '^(?:[a-f0-9]{32}|[a-z]{3,5}(?:-[a-z]{3,5}){3})$') {
     throw 'TransferId must be four words joined by hyphens (as shown on the upload page) or 32 hexadecimal characters.'
 }
+if (-not $Token) { $Token = $env:GETOUT_TOKEN }
+if (-not $Token) {
+    throw 'Set $Env:GETOUT_TOKEN (or pass -Token) to the script access token shown on the upload page; uploading requires signing in.'
+}
+if ($Token -cnotmatch '^[a-f0-9]{64}$') { throw 'Token must be 64 hexadecimal characters (copy it from the upload page).' }
 Add-Type -AssemblyName System.Net.Http
 # Windows PowerShell uses the machine's TLS settings, with TLS 1.2 also enabled.
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -41,10 +48,15 @@ if ($baseUri.Scheme -eq 'http' -and -not $baseUri.IsLoopback) {
 $baseUrl = $baseUri.AbsoluteUri.TrimEnd('/')
 $handler = [Net.Http.HttpClientHandler]::new()
 $handler.AllowAutoRedirect = $false
+# Send our own Cookie header verbatim rather than letting the handler manage a cookie jar.
+$handler.UseCookies = $false
 $client = [Net.Http.HttpClient]::new($handler)
 $client.Timeout = [TimeSpan]::FromSeconds(60)
 $client.DefaultRequestHeaders.TryAddWithoutValidation('Cache-Control', 'no-store, no-cache') | Out-Null
 $client.DefaultRequestHeaders.TryAddWithoutValidation('Pragma', 'no-cache') | Out-Null
+# The token signs the scripts in; it travels as the session cookie, never on the command line.
+$client.DefaultRequestHeaders.TryAddWithoutValidation('Cookie', "getout_session=$Token") | Out-Null
+Remove-Variable Token
 if ([decimal]::Round($ExpiresHours, 2) -ne $ExpiresHours) { throw 'ExpiresHours allows at most two decimal places.' }
 $startAuthorization = $null
 if ($null -ne $DownloadPassword) {
@@ -78,6 +90,9 @@ function Invoke-UploadGet {
             }
             # Never print a request URL, payload, or a transport exception containing one.
             $failure = "Upload request rejected (HTTP $statusCode)."
+            if ($statusCode -eq 401) {
+                $failure = 'Sign-in required or expired: set $Env:GETOUT_TOKEN to a current script access token from the upload page.'
+            }
             $retry = ($statusCode -eq 408 -or $statusCode -eq 429 -or $statusCode -ge 500)
         }
         catch {
